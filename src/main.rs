@@ -1,9 +1,17 @@
 mod netif_mon;
-
 use netif_mon::NetIfMon;
 
-fn main() {
-    
-    let nm = NetIfMon::new();
-    println!("{}", nm.to_string());
+#[tokio::main]
+async fn main() {
+    let thread = match NetIfMon::start().await {
+        Ok(thread) => thread,
+        Err(e) => {
+            eprintln!("Error: {}", e);
+            std::process::exit(1);
+        }
+    };
+
+    if let Err(e) = thread.await {
+        eprintln!("Error: {}", e);
+    }
 }
