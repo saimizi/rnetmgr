@@ -18,6 +18,62 @@ use std::net::Ipv4Addr;
 use tokio::io::{Error, ErrorKind, Result};
 use tokio::task::JoinHandle;
 
+pub enum NetIfEvent {
+    StateFlag(u32),
+    AddMac(Vec<u8>),
+    AddIpv4Addr(Ipv4Addr),
+    DelIpv4Addr(Ipv4Addr),
+}
+
+pub trait NetIfOp {
+    fn ifname(&self) -> String;
+
+    fn handle_event(&mut self, nes: Vec<NetIfEvent>) -> Result<()> {
+        for ne in nes.into_iter() {
+            match ne {
+                NetIfEvent::StateFlag(flags) => {
+                    let mut state = Vec::<String>::new();
+                    if (flags & rtnl::constants::IFF_BROADCAST) == rtnl::constants::IFF_BROADCAST {
+                        state.push("BROADCAST".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_MULTICAST) == rtnl::constants::IFF_MULTICAST {
+                        state.push("MULTICAST".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_RUNNING) == rtnl::constants::IFF_RUNNING {
+                        state.push("RUNNING".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_UP) == rtnl::constants::IFF_UP {
+                        state.push("UP".to_string());
+                    } else {
+                        state.push("DOWN".to_string());
+                    }
+                    println!("{} [{}]", self.ifname(), state.join(" "));
+                }
+                NetIfEvent::AddIpv4Addr(addr) => {
+                    println!("{} add addr {}", self.ifname(), addr.to_string());
+                }
+                NetIfEvent::DelIpv4Addr(addr) => {
+                    println!("{} del addr {}", self.ifname(), addr.to_string());
+                }
+                NetIfEvent::AddMac(mac) => {
+                    println!(
+                        "{} mac addr {}",
+                        self.ifname(),
+                        mac.iter()
+                            .map(|a| format!("{:02x}", a))
+                            .collect::<Vec<String>>()
+                            .join(":")
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 struct NetIf {
     ifname: String,
     ipv4: Vec<Ipv4Addr>,
@@ -60,9 +116,85 @@ impl Display for NetIf {
     }
 }
 
+impl NetIfOp for NetIf {
+    fn ifname(&self) -> String {
+        self.ifname.clone()
+    }
+
+    fn handle_event(&mut self, nes: Vec<NetIfEvent>) -> Result<()> {
+        for ne in nes.into_iter() {
+            match ne {
+                NetIfEvent::StateFlag(flags) => {
+                    let mut state = Vec::<String>::new();
+                    if (flags & rtnl::constants::IFF_BROADCAST != 0)
+                        && (self.flags & rtnl::constants::IFF_BROADCAST == 0)
+                    {
+                        state.push("BROADCAST".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_MULTICAST != 0)
+                        && (self.flags & rtnl::constants::IFF_MULTICAST == 0)
+                    {
+                        state.push("MULTICAST".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_RUNNING != 0)
+                        && (self.flags & rtnl::constants::IFF_RUNNING == 0)
+                    {
+                        state.push("RUNNING".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_RUNNING == 0)
+                        && (self.flags & rtnl::constants::IFF_RUNNING != 0)
+                    {
+                        state.push("STOPPED".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_UP != 0)
+                        && (self.flags & rtnl::constants::IFF_UP == 0)
+                    {
+                        state.push("UP".to_string());
+                    }
+
+                    if (flags & rtnl::constants::IFF_UP == 0)
+                        && (self.flags & rtnl::constants::IFF_UP != 0)
+                    {
+                        state.push("DOWN".to_string());
+                    }
+
+                    println!("{} State changed: [{}]", self.ifname(), state.join(" "));
+                    self.set_flags(flags);
+                }
+                NetIfEvent::AddIpv4Addr(addr) => {
+                    println!("{} add addr {}", self.ifname(), addr.to_string());
+                    self.add_ipv4_addr(&addr);
+                }
+                NetIfEvent::DelIpv4Addr(addr) => {
+                    println!("{} del addr {}", self.ifname(), addr.to_string());
+                    self.remove_ipv4_addr(&addr);
+                }
+                NetIfEvent::AddMac(mac) => {
+                    if mac != self.mac {
+                        println!(
+                            "{} mac addr {}",
+                            self.ifname(),
+                            mac.iter()
+                                .map(|a| format!("{:02x}", a))
+                                .collect::<Vec<String>>()
+                                .join(":")
+                        );
+                        self.set_mac(mac);
+                    }
+                }
+            }
+        }
+        Ok(())
+    }
+}
+
 impl NetIf {
-    fn add_ipv4_addr(&mut self, ipv4addr: Ipv4Addr) {
-        self.ipv4.push(ipv4addr);
+    fn add_ipv4_addr(&mut self, ipv4addr: &Ipv4Addr) {
+        self.ipv4.push(*ipv4addr);
     }
 
     fn remove_ipv4_addr(&mut self, ipv4addr: &Ipv4Addr) {
@@ -184,6 +316,7 @@ impl NetIfMon {
                     }
                     NetlinkPayload::InnerMessage(RtnlMessage::NewLink(lm)) => {
                         let mut ifname = String::new();
+                        let mut nie = vec![NetIfEvent::StateFlag(lm.header.flags)];
                         let mut mac = Vec::<u8>::new();
 
                         for nla in lm.nlas {
@@ -193,6 +326,7 @@ impl NetIfMon {
                                 }
                                 rtnl::link::nlas::Nla::Address(addr) => {
                                     mac = addr.clone();
+                                    nie.push(NetIfEvent::AddMac(addr));
                                 }
                                 _ => {}
                             }
@@ -200,11 +334,9 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(nif) = self.netif_hash.get_mut(&ifname) {
-                                if !mac.is_empty() {
-                                    nif.set_mac(mac);
+                                if !nie.is_empty() {
+                                    nif.handle_event(nie).unwrap_or(());
                                 }
-                                nif.set_flags(lm.header.flags);
-                                println!("UPDATE_LINK: {}", nif);
                             } else {
                                 let nif = NetIf {
                                     ifname: ifname.clone(),
@@ -212,14 +344,13 @@ impl NetIfMon {
                                     mac,
                                     flags: lm.header.flags,
                                 };
-                                println!("ADD_LINK: {}", nif);
                                 self.netif_hash.insert(ifname, nif);
                             }
                         }
                     }
                     NetlinkPayload::InnerMessage(RtnlMessage::DelAddress(am)) => {
                         let mut ifname = String::new();
-                        let mut ipv4: Option<Ipv4Addr> = None;
+                        let mut nie = Vec::<NetIfEvent>::new();
 
                         for nla in am.nlas {
                             match nla {
@@ -233,41 +364,7 @@ impl NetIfMon {
                                         .collect::<Vec<String>>()
                                         .join(".");
                                     if let Ok(a) = ipv4_addr.parse() {
-                                        ipv4 = Some(a);
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if !ifname.is_empty() {
-                            if let Some(ipv4addr) = ipv4 {
-                                println!("DEL_ADDRESS: {} from {}", ipv4addr.to_string(), ifname);
-                                if let Some(nif) = self.netif_hash.get_mut(&ifname) {
-                                    nif.remove_ipv4_addr(&ipv4addr);
-                                    println!("DEL_ADDRESS: {}", nif);
-                                }
-                            }
-                        }
-                    }
-
-                    NetlinkPayload::InnerMessage(RtnlMessage::NewAddress(am)) => {
-                        let mut ifname = String::new();
-                        let mut ipv4: Option<Ipv4Addr> = None;
-
-                        for nla in am.nlas {
-                            match nla {
-                                rtnl::address::nlas::Nla::Label(l) => {
-                                    ifname = l.clone();
-                                }
-                                rtnl::address::nlas::Nla::Address(addr) => {
-                                    let ipv4_addr = addr
-                                        .iter()
-                                        .map(|a| format! {"{}", a})
-                                        .collect::<Vec<String>>()
-                                        .join(".");
-                                    if let Ok(a) = ipv4_addr.parse() {
-                                        ipv4 = Some(a);
+                                        nie.push(NetIfEvent::DelIpv4Addr(a));
                                     }
                                 }
                                 _ => {}
@@ -276,9 +373,40 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(nif) = self.netif_hash.get_mut(&ifname) {
-                                if let Some(addr) = ipv4 {
-                                    nif.add_ipv4_addr(addr);
-                                    println!("UPDATE_ADDRESS: {}", nif);
+                                if !nie.is_empty() {
+                                    nif.handle_event(nie).unwrap_or(());
+                                }
+                            }
+                        }
+                    }
+
+                    NetlinkPayload::InnerMessage(RtnlMessage::NewAddress(am)) => {
+                        let mut ifname = String::new();
+                        let mut nie = Vec::<NetIfEvent>::new();
+
+                        for nla in am.nlas {
+                            match nla {
+                                rtnl::address::nlas::Nla::Label(l) => {
+                                    ifname = l.clone();
+                                }
+                                rtnl::address::nlas::Nla::Address(addr) => {
+                                    let ipv4_addr = addr
+                                        .iter()
+                                        .map(|a| format! {"{}", a})
+                                        .collect::<Vec<String>>()
+                                        .join(".");
+                                    if let Ok(a) = ipv4_addr.parse() {
+                                        nie.push(NetIfEvent::AddIpv4Addr(a));
+                                    }
+                                }
+                                _ => {}
+                            }
+                        }
+
+                        if !ifname.is_empty() {
+                            if let Some(nif) = self.netif_hash.get_mut(&ifname) {
+                                if !nie.is_empty() {
+                                    nif.handle_event(nie).unwrap_or(());
                                 }
                             } else {
                                 let nif = NetIf {
@@ -287,7 +415,6 @@ impl NetIfMon {
                                     mac: Vec::<u8>::new(),
                                     flags: 0,
                                 };
-                                println!("ADD_ADDRESS: {}", nif);
                                 self.netif_hash.insert(ifname.clone(), nif);
                             }
                         }
