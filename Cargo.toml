@@ -1,7 +1,9 @@
 [package]
 name = "rnetmgr"
 version = "0.1.0"
-edition = "2021"
+authors = ["Seimizu Joukan <saimizi@gmail.com>"]
+edition = "2018"
+repository = "git@gitlab.com:joukan/netmgr.git"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
