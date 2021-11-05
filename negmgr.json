@@ -1,0 +1,15 @@
+{
+    "netifs" : [
+        {
+            "ifname" : "br0",
+            "iftype" : "Ethernet",
+            "addr_type": "DHCP"
+        },
+        {
+            "ifname" : "eth1",
+            "iftype" : "Ethernet",
+            "addr_type": "Static",
+            "ipv4" : "192.168.28.123"
+        }
+    ]
+}
