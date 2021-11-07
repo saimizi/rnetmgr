@@ -22,12 +22,41 @@ use crate::{NetIfConfig, NetIfConfigEntry};
 
 #[derive(Debug)]
 pub enum NetIfEvent {
-    AddLink,
+    AddLink(u32),
     DelLink,
-    StateFlag(u32),
     AddMac(Vec<u8>),
     AddIpv4Addr(Ipv4Addr),
     DelIpv4Addr(Ipv4Addr),
+}
+
+impl NetIfEvent {
+    pub fn state_flag_str(flags: u32) -> Vec<String> {
+        let mut state = Vec::<String>::new();
+        if flags & rtnl::constants::IFF_BROADCAST != 0 {
+            state.push("BROADCAST".to_string());
+        }
+
+        if flags & rtnl::constants::IFF_MULTICAST != 0 {
+            state.push("MULTICAST".to_string());
+        }
+
+        if flags & rtnl::constants::IFF_RUNNING != 0 {
+            state.push("RUNNING".to_string());
+        }
+
+        if flags & rtnl::constants::IFF_RUNNING == 0 {
+            state.push("STOPPED".to_string());
+        }
+
+        if flags & rtnl::constants::IFF_UP != 0 {
+            state.push("UP".to_string());
+        }
+
+        if flags & rtnl::constants::IFF_UP == 0 {
+            state.push("DOWN".to_string());
+        }
+        state
+    }
 }
 
 enum NetIfType {
@@ -39,14 +68,26 @@ enum NetIfType {
 pub trait NetIfOp {
     fn ifname(&self) -> String;
     fn handle_event(&mut self, rx: &mut Receiver<NetIfEvent>) -> Result<()>;
+    fn run(
+        mut tgt: impl NetIfOp + Send + 'static,
+        mut rx: Receiver<NetIfEvent>,
+    ) -> JoinHandle<Result<()>> {
+        thread::spawn(move || -> Result<()> {
+            println!("Start thread for {}", tgt.ifname());
+            loop {
+                tgt.handle_event(&mut rx)?;
+            }
+        })
+    }
 }
 
 pub struct NetIfSetting {
+    #[allow(unused)]
     iftype: NetIfType,
 }
 
 impl NetIfSetting {
-    pub fn from(cfg: NetIfConfigEntry) -> NetIfSetting {
+    pub fn from(cfg: NetIfConfigEntry) -> Result<NetIfSetting> {
         let mut iftype = NetIfType::Invalid;
 
         if cfg.iftype == "Ethernet" {
@@ -63,9 +104,14 @@ impl NetIfSetting {
             }
         }
 
-        NetIfSetting { iftype }
+        if !matches!(iftype, NetIfType::Invalid) {
+            Ok(NetIfSetting { iftype })
+        } else {
+            Err(Error::new(ErrorKind::InvalidData, "Invalid config data"))
+        }
     }
 
+    #[allow(unused)]
     pub fn is_valid(&self) -> bool {
         !matches!(self.iftype, NetIfType::Invalid)
     }
@@ -79,44 +125,51 @@ pub struct NetIfRunTime {
 
 struct NetIf {
     ifname: String,
+    #[allow(unused)]
     setting: NetIfSetting,
-    runtime: NetIfRunTime,
+    runtime: Option<NetIfRunTime>,
 }
 
 impl Display for NetIf {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        let mut ipv4_str = self
-            .runtime
-            .ipv4
-            .iter()
-            .map(|a| a.to_string())
-            .collect::<Vec<String>>()
-            .join("/");
+        if let Some(runtime) = &self.runtime {
+            let mut ipv4_str = runtime
+                .ipv4
+                .iter()
+                .map(|a| a.to_string())
+                .collect::<Vec<String>>()
+                .join("/");
 
-        if ipv4_str.is_empty() {
-            ipv4_str = "None".to_string();
+            if ipv4_str.is_empty() {
+                ipv4_str = "None".to_string();
+            }
+
+            let mut mac_str = runtime
+                .mac
+                .iter()
+                .map(|a| format!("{:02x}", a))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            if mac_str.is_empty() {
+                mac_str = "None".to_string();
+            }
+
+            write!(
+                f,
+                "ifname: {:20} mac: {:18} ipv4: {:20} [{}]",
+                self.ifname,
+                mac_str,
+                ipv4_str,
+                NetIfEvent::state_flag_str(runtime.flags).join(" ")
+            )
+        } else {
+            write!(
+                f,
+                "ifname: {:20} mac: {:18} ipv4: {:20} []",
+                self.ifname, "None", "None",
+            )
         }
-
-        let mut mac_str = self
-            .runtime
-            .mac
-            .iter()
-            .map(|a| format!("{:02x}", a))
-            .collect::<Vec<String>>()
-            .join(":");
-
-        if mac_str.is_empty() {
-            mac_str = "None".to_string();
-        }
-
-        write!(
-            f,
-            "ifname: {:20} mac: {:18} ipv4: {:20} [{}]",
-            self.ifname,
-            mac_str,
-            ipv4_str,
-            self.state_str(),
-        )
     }
 }
 
@@ -126,131 +179,103 @@ impl NetIfOp for NetIf {
     }
 
     fn handle_event(&mut self, rx: &mut Receiver<NetIfEvent>) -> Result<()> {
-        println!("Wait!!!");
         let ne = rx.recv();
-        println!("received event!!!");
         match ne {
-            Ok(NetIfEvent::AddLink) => {
-                println!("{} added", self.ifname());
+            Ok(NetIfEvent::AddLink(flags)) => {
+                if let Some(runtime) = &mut self.runtime {
+                    let state_new = NetIfEvent::state_flag_str(flags);
+                    let state_old = NetIfEvent::state_flag_str(runtime.flags);
+                    let mut state_changed = vec![];
+
+                    for flag in state_new.into_iter() {
+                        if !state_old.iter().any(|a| *a == flag) {
+                            state_changed.push(flag);
+                        }
+                    }
+
+                    println!(
+                        "{} State changed: [{}]",
+                        self.ifname,
+                        state_changed.join(" ")
+                    );
+                    runtime.flags = flags;
+                } else {
+                    self.runtime = Some(NetIfRunTime {
+                        ipv4: vec![],
+                        mac: vec![],
+                        flags,
+                    });
+                    println!(
+                        "{}: added State: [{}]",
+                        self.ifname(),
+                        NetIfEvent::state_flag_str(flags).join(" ")
+                    );
+                }
             }
             Ok(NetIfEvent::DelLink) => {
-                println!("{} deleted", self.ifname());
-            }
-            Ok(NetIfEvent::StateFlag(flags)) => {
-                let mut state = Vec::<String>::new();
-                if (flags & rtnl::constants::IFF_BROADCAST != 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_BROADCAST == 0)
-                {
-                    state.push("BROADCAST".to_string());
+                if self.runtime.is_some() {
+                    println!("{}: deleted", self.ifname());
+                    self.runtime = None;
                 }
-
-                if (flags & rtnl::constants::IFF_MULTICAST != 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_MULTICAST == 0)
-                {
-                    state.push("MULTICAST".to_string());
-                }
-
-                if (flags & rtnl::constants::IFF_RUNNING != 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_RUNNING == 0)
-                {
-                    state.push("RUNNING".to_string());
-                }
-
-                if (flags & rtnl::constants::IFF_RUNNING == 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_RUNNING != 0)
-                {
-                    state.push("STOPPED".to_string());
-                }
-
-                if (flags & rtnl::constants::IFF_UP != 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_UP == 0)
-                {
-                    state.push("UP".to_string());
-                }
-
-                if (flags & rtnl::constants::IFF_UP == 0)
-                    && (self.runtime.flags & rtnl::constants::IFF_UP != 0)
-                {
-                    state.push("DOWN".to_string());
-                }
-
-                println!("{} State changed: [{}]", self.ifname(), state.join(" "));
-                self.set_flags(flags);
             }
             Ok(NetIfEvent::AddIpv4Addr(addr)) => {
-                println!("{} add addr {}", self.ifname(), addr.to_string());
-                self.add_ipv4_addr(&addr);
+                if let Some(runtime) = &mut self.runtime {
+                    if !runtime.ipv4.iter().any(|a| *a == addr) {
+                        println!("{}:  addr {} is added", self.ifname, addr.to_string());
+                        runtime.ipv4.push(addr);
+                    }
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        format!("AddIpv4Addr: Link {} not created.", self.ifname),
+                    ));
+                }
             }
             Ok(NetIfEvent::DelIpv4Addr(addr)) => {
-                println!("{} del addr {}", self.ifname(), addr.to_string());
-                self.remove_ipv4_addr(&addr);
+                if let Some(runtime) = &mut self.runtime {
+                    let mut addrs = vec![];
+
+                    for a in &runtime.ipv4 {
+                        if a != &addr {
+                            addrs.push(addr.to_owned());
+                        } else {
+                            println!("{}: addr {} is deleted", self.ifname, addr.to_string());
+                        }
+                    }
+                    runtime.ipv4 = addrs;
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        format!("DelIpv4Addr: Link {} not created.", self.ifname),
+                    ));
+                }
             }
             Ok(NetIfEvent::AddMac(mac)) => {
-                if mac != self.runtime.mac {
-                    println!(
-                        "{} mac addr {}",
-                        self.ifname(),
-                        mac.iter()
-                            .map(|a| format!("{:02x}", a))
-                            .collect::<Vec<String>>()
-                            .join(":")
-                    );
-                    self.set_mac(mac);
+                if let Some(runtime) = &mut self.runtime {
+                    if mac != runtime.mac {
+                        println!(
+                            "{} mac addr {}",
+                            self.ifname,
+                            mac.iter()
+                                .map(|a| format!("{:02x}", a))
+                                .collect::<Vec<String>>()
+                                .join(":")
+                        );
+                        runtime.mac = mac;
+                    }
+                } else {
+                    return Err(Error::new(
+                        ErrorKind::NotFound,
+                        format!("AddMac: Link {} not created.", self.ifname),
+                    ));
                 }
             }
             Err(_e) => {
                 return Err(Error::new(ErrorKind::Other, "Closed"));
             }
         }
+
         Ok(())
-    }
-}
-
-impl NetIf {
-    fn add_ipv4_addr(&mut self, ipv4addr: &Ipv4Addr) {
-        self.runtime.ipv4.push(*ipv4addr);
-    }
-
-    fn remove_ipv4_addr(&mut self, ipv4addr: &Ipv4Addr) {
-        let mut addrs = vec![];
-
-        for addr in &self.runtime.ipv4 {
-            if addr != ipv4addr {
-                addrs.push(addr.to_owned());
-            }
-        }
-        self.runtime.ipv4 = addrs;
-    }
-
-    fn set_mac(&mut self, mac: Vec<u8>) {
-        self.runtime.mac = mac;
-    }
-
-    fn set_flags(&mut self, flags: u32) {
-        self.runtime.flags = flags;
-    }
-
-    fn state_str(&self) -> String {
-        let mut state = Vec::<String>::new();
-        if (self.runtime.flags & rtnl::constants::IFF_BROADCAST) == rtnl::constants::IFF_BROADCAST {
-            state.push("BROADCAST".to_string());
-        }
-
-        if (self.runtime.flags & rtnl::constants::IFF_MULTICAST) == rtnl::constants::IFF_MULTICAST {
-            state.push("MULTICAST".to_string());
-        }
-
-        if (self.runtime.flags & rtnl::constants::IFF_RUNNING) == rtnl::constants::IFF_RUNNING {
-            state.push("RUNNING".to_string());
-        }
-
-        if (self.runtime.flags & rtnl::constants::IFF_UP) == rtnl::constants::IFF_UP {
-            state.push("UP".to_string());
-        } else {
-            state.push("DOWN".to_string());
-        }
-
-        state.join(" ")
     }
 }
 
@@ -277,30 +302,18 @@ impl NetIfMon {
         let mut handlers = vec![];
 
         for cfg in nifcfg.netifs {
-            let (tx, mut rx) = mpsc::channel();
+            let (tx, rx) = mpsc::channel();
             let ifname = cfg.ifname.clone();
             netif_hash.insert(ifname.clone(), tx);
-            let setting = NetIfSetting::from(cfg);
-            if !setting.is_valid() {
-                return Err(Error::new(ErrorKind::InvalidData, "Invalid cfg data"));
-            }
 
-            let mut nif = NetIf {
-                ifname,
-                setting,
-                runtime: NetIfRunTime {
-                    ipv4: Vec::<Ipv4Addr>::new(),
-                    mac: Vec::<u8>::new(),
-                    flags: 0,
+            handlers.push(NetIf::run(
+                NetIf {
+                    ifname,
+                    setting: NetIfSetting::from(cfg)?,
+                    runtime: None,
                 },
-            };
-
-            handlers.push(thread::spawn(move || -> Result<()> {
-                println!("Start thread for {}", nif.ifname());
-                loop {
-                    nif.handle_event(&mut rx)?;
-                }
-            }))
+                rx,
+            ));
         }
 
         let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
@@ -363,13 +376,12 @@ impl NetIfMon {
                     }
                     NetlinkPayload::InnerMessage(RtnlMessage::NewLink(lm)) => {
                         let mut ifname = String::new();
-                        let mut nie = vec![NetIfEvent::StateFlag(lm.header.flags)];
+                        let mut nie = vec![NetIfEvent::AddLink(lm.header.flags)];
 
                         for nla in lm.nlas {
                             match nla {
                                 rtnl::link::nlas::Nla::IfName(name) => {
                                     ifname = name.clone();
-                                    nie.push(NetIfEvent::AddLink);
                                 }
                                 rtnl::link::nlas::Nla::Address(addr) => {
                                     nie.push(NetIfEvent::AddMac(addr));
