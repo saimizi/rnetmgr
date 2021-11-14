@@ -1,6 +1,6 @@
-mod netif_mon;
+mod netif;
 use clap::{App, Arg};
-use netif_mon::NetIfMon;
+use netif::NetIfMon;
 use serde_derive::{Deserialize, Serialize};
 use std::fs;
 
