@@ -16,7 +16,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::net::Ipv4Addr;
 use std::thread;
 
-use crate::{NetIfConfig, NetIfConfigEntry};
+use crate::{NetIfConfig, NetIfConfigEntry, ferror, fwarn};
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -298,7 +298,7 @@ impl NetIf {
         match self.iftype {
             NetIfType::EthernetStaticIpv4(ipv4addr) => {
                 if let Err(e) = self.set_ipv4_addr(ipv4addr) {
-                    eprintln!(
+                    ferror!(
                         "Failed to set up {} with {} : {}",
                         self.ifname,
                         self.iftype.to_string(),
@@ -307,7 +307,7 @@ impl NetIf {
                 }
             }
             _ => {
-                eprintln!(
+                ferror!(
                     "Interface type {} not is supported ({})",
                     self.iftype.to_string(),
                     self.ifname
@@ -350,10 +350,10 @@ impl NetIf {
             if let NetIfType::EthernetStaticIpv4(addr) = self.iftype {
                 if addr == ipaddr {
                     self.state = NetIfState::Init;
-                    eprintln!(
+                    fwarn!(
                         "Static IP address {} for {} is removed, try to reset it",
                         addr.to_string(),
-                        self.ifname,
+                        self.ifname
                     );
 
                     reset_ip = true;
@@ -435,7 +435,7 @@ impl NetIfMon {
             };
 
             if netif.is_valid() {
-                eprintln!("Invalid configuration :{}", netif.ifname());
+                ferror!("Invalid configuration :{}", netif.ifname());
                 std::process::exit(1);
             }
 
@@ -451,7 +451,7 @@ impl NetIfMon {
             thread::spawn(move || -> Result<()> { mon_thread(NetIfMon { socket, netif_hash }) });
 
         if let Err(_e) = handler.join() {
-            eprintln!("Error!");
+            ferror!("Error!");
         }
 
         Ok(())
@@ -475,7 +475,7 @@ impl NetIfMon {
                         break 'main;
                     }
                     NetlinkPayload::Error(e) => {
-                        eprint!("Error: {}", e);
+                        ferror!("Error: {}", e);
                         return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
                     }
                     NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
@@ -490,7 +490,7 @@ impl NetIfMon {
                         if !ifname.is_empty() {
                             if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                 n.reset();
-                                println!("{} link disconnected.", n.ifname());
+                                fwarn!("{} link disconnected.", n.ifname());
                             }
                         }
                     }
