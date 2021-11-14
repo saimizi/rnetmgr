@@ -7,6 +7,9 @@ use logger::js_logger_init;
 use netif::NetIfMon;
 use serde_derive::{Deserialize, Serialize};
 use std::fs;
+
+
+
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetIfConfigEntry {
     ifname: String,
@@ -51,7 +54,8 @@ fn main() {
     match matches.occurrences_of("verbos") {
         0 => js_logger_init(matches.value_of("log-file"), LevelFilter::Info, false),
         1 => js_logger_init(matches.value_of("log-file"), LevelFilter::Debug, false),
-        2 | _ => js_logger_init(matches.value_of("log-file"), LevelFilter::Debug, true),
+        2 => js_logger_init(matches.value_of("log-file"), LevelFilter::Debug, true),
+        _ => js_logger_init(matches.value_of("log-file"), LevelFilter::Trace, true),
     }
 
     let config_file = matches.value_of("config-file").unwrap();

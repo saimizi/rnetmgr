@@ -1,7 +1,7 @@
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkMessage, NetlinkHeader, NetlinkMessage,
-    NetlinkPayload, RtnlMessage, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+    NetlinkPayload, RtnlMessage, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK
 };
 
 use netlink_sys::protocols::NETLINK_ROUTE;
@@ -16,7 +16,7 @@ use std::io::{Error, ErrorKind, Result};
 use std::net::Ipv4Addr;
 use std::thread;
 
-use crate::{NetIfConfig, NetIfConfigEntry, ferror, fwarn};
+use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -31,8 +31,8 @@ impl Display for NetIfType {
             f,
             "{}",
             match self {
-                NetIfType::EthernetDHCP => "EthernetDHCP",
-                NetIfType::EthernetStaticIpv4(_) => "EthernetStaticIpv4",
+                NetIfType::EthernetDHCP => "Ethernet+DHCP",
+                NetIfType::EthernetStaticIpv4(_) => "Ethernet+Static+Ipv4",
                 NetIfType::Invalid => "Invalid",
             }
         )
@@ -143,7 +143,7 @@ impl Display for NetIfRunTime {
 
         write!(
             f,
-            "if_index: {:2} mac: {:18} ipv4: {:20} [{}]",
+            "IF_INDEX:{:2} MAC: {:18} IPV4: {:15} [{}]",
             self.if_index,
             mac_str,
             ipv4_str,
@@ -236,7 +236,7 @@ impl Display for NetIfState {
             "{}",
             match self {
                 NetIfState::Init => "Init".to_string(),
-                NetIfState::Established => "Established".to_string(),
+                NetIfState::Established => "Fini".to_string(),
             }
         )
     }
@@ -253,7 +253,7 @@ impl Display for NetIf {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(
             f,
-            "{}:{:20}{:15}{}",
+            "IFNAME:{:4} TYPE: {:20} STATE: {:5} {}",
             self.ifname,
             self.iftype.to_string(),
             self.state.to_string(),
@@ -295,6 +295,7 @@ impl NetIf {
     }
 
     pub fn newlink_setup(&self) {
+        fdebug!("Start to setup {}", self.ifname);
         match self.iftype {
             NetIfType::EthernetStaticIpv4(ipv4addr) => {
                 if let Err(e) = self.set_ipv4_addr(ipv4addr) {
@@ -325,10 +326,12 @@ impl NetIf {
         if self.state == NetIfState::Init {
             match self.iftype {
                 NetIfType::EthernetDHCP => {
+                    finfo!("{} established ({})", self.ifname, self.iftype);
                     self.state = NetIfState::Established;
                 }
                 NetIfType::EthernetStaticIpv4(addr) => {
                     if addr == ipaddr {
+                        finfo!("{} established ({})", self.ifname, self.iftype);
                         self.state = NetIfState::Established;
                     }
                 }
@@ -369,6 +372,7 @@ impl NetIf {
     }
 
     fn set_ipv4_addr(&self, ipaddr: Ipv4Addr) -> Result<()> {
+        fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         let r = self
             .runtime
             .as_ref()
@@ -402,6 +406,42 @@ impl NetIf {
 
         socket.send(&buf[..], 0)?;
 
+        let mut receive_buffer = vec![0; 4096];
+        let mut offset = 0;
+
+        'main: loop {
+            let size = socket.recv(&mut receive_buffer[..], 0)?;
+
+            loop {
+                let bytes = &receive_buffer[offset..];
+                let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
+
+                match rx_packet.payload {
+                    NetlinkPayload::Done => {
+                        ftrace!("NewAddress Receive Packet process Done");
+                        break 'main;
+                    }
+
+                    NetlinkPayload::Error(e) => {
+                        return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
+                    }
+
+                    NetlinkPayload::Ack(e) => {
+                        finfo!("NewAddress ACK: {}", e);
+                    }
+
+                    _ => {fdebug!{"Unknown message"}},
+                }
+
+                offset += rx_packet.header.length as usize;
+                if offset == size || rx_packet.header.length == 0 {
+                    offset = 0;
+                    break;
+                }
+            }
+        }
+
         Ok(())
     }
 }
@@ -434,9 +474,11 @@ impl NetIfMon {
                 runtime: None,
             };
 
-            if netif.is_valid() {
+            if !netif.is_valid() {
                 ferror!("Invalid configuration :{}", netif.ifname());
                 std::process::exit(1);
+            } else {
+                fdebug!("{}", netif);
             }
 
             netif_hash.insert(netif.ifname(), netif);
@@ -472,6 +514,7 @@ impl NetIfMon {
 
                 match rx_packet.payload {
                     NetlinkPayload::Done => {
+                        ftrace!("Packet process Done");
                         break 'main;
                     }
                     NetlinkPayload::Error(e) => {
@@ -488,6 +531,7 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
+                            ftrace!("DelLink: {}", ifname);
                             if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                 n.reset();
                                 fwarn!("{} link disconnected.", n.ifname());
@@ -514,10 +558,12 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
+                            ftrace!("NewLink: {}", ifname);
                             if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                 /* This may only update flags for established interface */
                                 n.set_runtime(NetIfRunTime::new(if_index, mac, flags))?;
                                 if !n.is_established() {
+                                    fdebug!("{}", n);
                                     n.newlink_setup();
                                 }
                             }
@@ -547,9 +593,10 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                if let Some(a) = ipaddr {
-                                    n.unreg_ipv4_addr(a);
+                            if let Some(addr) = ipaddr {
+                                ftrace!("{} Del address {}", ifname, addr);
+                                if let Some(n) = self.netif_hash.get_mut(&ifname) {
+                                    n.unreg_ipv4_addr(addr);
                                 }
                             }
                         }
@@ -579,9 +626,10 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                if let Some(a) = ipaddr {
-                                    n.reg_ipv4_addr(a);
+                            if let Some(addr) = ipaddr {
+                                ftrace!("{} New address {}", ifname, addr);
+                                if let Some(n) = self.netif_hash.get_mut(&ifname) {
+                                    n.reg_ipv4_addr(addr);
                                 }
                             }
                         }

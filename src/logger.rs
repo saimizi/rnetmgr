@@ -1,5 +1,4 @@
 use log::LevelFilter;
-use log4rs;
 use log4rs::append::console::ConsoleAppender;
 use log4rs::append::file::FileAppender;
 use log4rs::config::{Appender, Config, Root};
@@ -49,18 +48,31 @@ macro_rules! fdebug {
     }};
 }
 
+#[macro_export]
+macro_rules! ftrace {
+    () => {
+        log::trace!("arrived.");
+    };
+    ($val:tt) => {
+        log::trace!("{}", $val);
+    };
+    ($fmt:expr,$($val:expr),*) => {{
+        log::trace!( "{}", format!($fmt, $($val),*));
+    }};
+}
+
 pub fn js_logger_init(logf: Option<&str>, level: LevelFilter, detail: bool) {
     if let Some(f) = logf {
         let filelog = match detail {
             true => FileAppender::builder()
-            .encoder(Box::new(PatternEncoder::new("[{l}] <{t}> {f}:{L}: {m}{n}")))
-            .build(f)
-            .unwrap(),
+                .encoder(Box::new(PatternEncoder::new("[{l}] <{t}> {f}:{L}: {m}{n}")))
+                .build(f)
+                .unwrap(),
 
             false => FileAppender::builder()
-            .encoder(Box::new(PatternEncoder::new("[{l}] {m}{n}")))
-            .build(f)
-            .unwrap(),
+                .encoder(Box::new(PatternEncoder::new("[{l}] {m}{n}")))
+                .build(f)
+                .unwrap(),
         };
 
         let config = Config::builder()
@@ -69,8 +81,6 @@ pub fn js_logger_init(logf: Option<&str>, level: LevelFilter, detail: bool) {
             .unwrap();
 
         log4rs::init_config(config).unwrap();
-
-        return;
     } else if let Ok(a) = env::var("LOG4RS_CONFIG") {
         log4rs::init_file(a, Default::default()).unwrap_or(())
     } else {
