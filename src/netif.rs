@@ -1,7 +1,7 @@
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkMessage, NetlinkHeader, NetlinkMessage,
-    NetlinkPayload, RtnlMessage, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST, NLM_F_ACK
+    NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
 
 use netlink_sys::protocols::NETLINK_ROUTE;
@@ -18,10 +18,22 @@ use std::thread;
 
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
 
+#[derive(PartialEq, Eq, Clone, Copy)]
+pub struct Ipv4Entry {
+    pub ip: Ipv4Addr,
+    pub prefix_len: u8,
+}
+
+impl Display for Ipv4Entry {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(f, "{}/{}", self.ip, self.prefix_len,)
+    }
+}
+
 #[derive(PartialEq, Eq)]
 enum NetIfType {
     EthernetDHCP,
-    EthernetStaticIpv4(Ipv4Addr),
+    EthernetStaticIpv4(Ipv4Entry),
     Invalid,
 }
 
@@ -46,8 +58,22 @@ impl NetIfType {
         if cfg.iftype == "Ethernet" {
             if cfg.addr_type == "Static" {
                 if let Some(ipv4) = cfg.ipv4 {
-                    if let Ok(ipv4) = ipv4.parse() {
-                        iftype = NetIfType::EthernetStaticIpv4(ipv4);
+                    let tmp: Vec<&str> = ipv4.split('/').collect();
+                    let mut prefix_len: u8 = 24;
+
+                    if tmp.len() > 1 {
+                        if let Ok(l) = tmp[1].parse() {
+                            if l > 32 {
+                                return NetIfType::Invalid;
+                            }
+                            prefix_len = l;
+                        } else {
+                            return NetIfType::Invalid;
+                        }
+                    }
+
+                    if let Ok(ip) = tmp[0].parse() {
+                        iftype = NetIfType::EthernetStaticIpv4(Ipv4Entry { ip, prefix_len });
                     }
                 }
             }
@@ -66,7 +92,7 @@ impl NetIfType {
 }
 
 pub struct NetIfRunTime {
-    ipv4: Vec<Ipv4Addr>,
+    ipv4: Vec<Ipv4Entry>,
     mac: Vec<u8>,
     flags: u32,
     if_index: u32,
@@ -156,14 +182,14 @@ impl NetIfRunTime {
     pub fn new(if_index: u32, mac: Option<Vec<u8>>, flags: u32) -> NetIfRunTime {
         if let Some(mac) = mac {
             NetIfRunTime {
-                ipv4: Vec::<Ipv4Addr>::new(),
+                ipv4: Vec::<Ipv4Entry>::new(),
                 mac,
                 flags,
                 if_index,
             }
         } else {
             NetIfRunTime {
-                ipv4: Vec::<Ipv4Addr>::new(),
+                ipv4: Vec::<Ipv4Entry>::new(),
                 mac: Vec::<u8>::new(),
                 flags,
                 if_index,
@@ -175,7 +201,7 @@ impl NetIfRunTime {
         self.if_index
     }
 
-    pub fn del_ipv4_addr(&mut self, ipaddr: Ipv4Addr) {
+    pub fn del_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
         if self.ipv4.is_empty() {
             return;
         }
@@ -190,7 +216,7 @@ impl NetIfRunTime {
         self.ipv4 = new;
     }
 
-    pub fn add_ipv4_addr(&mut self, ipaddr: Ipv4Addr) {
+    pub fn add_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
         self.ipv4.push(ipaddr);
     }
 
@@ -317,7 +343,7 @@ impl NetIf {
         }
     }
 
-    pub fn reg_ipv4_addr(&mut self, ipaddr: Ipv4Addr) {
+    pub fn reg_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
         let r = match &mut self.runtime {
             Some(r) => r,
             None => return,
@@ -342,14 +368,14 @@ impl NetIf {
         r.add_ipv4_addr(ipaddr);
     }
 
-    pub fn unreg_ipv4_addr(&mut self, ipaddr: Ipv4Addr) {
+    pub fn unreg_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
         let mut reset_ip = false;
         let r = match &mut self.runtime {
             Some(r) => r,
             None => return,
         };
 
-        if self.state == NetIfState::Init {
+        if self.state == NetIfState::Established {
             if let NetIfType::EthernetStaticIpv4(addr) = self.iftype {
                 if addr == ipaddr {
                     self.state = NetIfState::Init;
@@ -371,7 +397,7 @@ impl NetIf {
         }
     }
 
-    fn set_ipv4_addr(&self, ipaddr: Ipv4Addr) -> Result<()> {
+    fn set_ipv4_addr(&self, ipaddr: Ipv4Entry) -> Result<()> {
         fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         let r = self
             .runtime
@@ -384,19 +410,28 @@ impl NetIf {
         socket.connect(&SocketAddr::new(0, 0))?;
 
         let header = AddressHeader {
+            family: 2,
+            prefix_len: ipaddr.prefix_len,
             index: r.ifindex(),
             ..Default::default()
         };
+
+        let iparray: Vec<u8> = ipaddr
+            .ip
+            .to_string()
+            .split('.')
+            .map(|a| a.parse::<u8>().unwrap())
+            .collect();
 
         let mut packet = NetlinkMessage {
             header: NetlinkHeader::default(),
             payload: NetlinkPayload::from(RtnlMessage::NewAddress(AddressMessage {
                 header,
-                nlas: vec![AddrNla::Address(ipaddr.to_string().into())],
+                nlas: vec![AddrNla::Local(iparray)],
             })),
         };
 
-        packet.header.flags = NLM_F_CREATE | NLM_F_EXCL | NLM_F_REQUEST;
+        packet.header.flags = NLM_F_CREATE | NLM_F_EXCL | NLM_F_REQUEST | NLM_F_ACK;
         packet.header.sequence_number = 1;
         packet.finalize();
 
@@ -424,14 +459,21 @@ impl NetIf {
                     }
 
                     NetlinkPayload::Error(e) => {
+                        if let Some(17) = e.to_io().raw_os_error() {
+                            fwarn!("Address {} has already been set for {}.", ipaddr, self.ifname);
+                            break 'main;
+                        }
                         return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
                     }
 
                     NetlinkPayload::Ack(e) => {
                         finfo!("NewAddress ACK: {}", e);
+                        break 'main;
                     }
 
-                    _ => {fdebug!{"Unknown message"}},
+                    _ => {
+                        fdebug! {"Unknown message"}
+                    }
                 }
 
                 offset += rx_packet.header.length as usize;
@@ -571,7 +613,7 @@ impl NetIfMon {
                     }
                     NetlinkPayload::InnerMessage(RtnlMessage::DelAddress(am)) => {
                         let mut ifname = String::new();
-                        let mut ipaddr: Option<Ipv4Addr> = None;
+                        let mut ipaddr: Option<Ipv4Entry> = None;
 
                         for nla in am.nlas {
                             match nla {
@@ -584,8 +626,9 @@ impl NetIfMon {
                                         .map(|a| format! {"{}", a})
                                         .collect::<Vec<String>>()
                                         .join(".");
-                                    if let Ok(a) = ipv4_addr.parse() {
-                                        ipaddr = Some(a);
+                                    if let Ok(ip) = ipv4_addr.parse() {
+                                        let prefix_len = am.header.prefix_len;
+                                        ipaddr = Some(Ipv4Entry { ip, prefix_len });
                                     }
                                 }
                                 _ => {}
@@ -604,7 +647,7 @@ impl NetIfMon {
 
                     NetlinkPayload::InnerMessage(RtnlMessage::NewAddress(am)) => {
                         let mut ifname = String::new();
-                        let mut ipaddr: Option<Ipv4Addr> = None;
+                        let mut ipaddr: Option<Ipv4Entry> = None;
 
                         for nla in am.nlas {
                             match nla {
@@ -617,8 +660,9 @@ impl NetIfMon {
                                         .map(|a| format! {"{}", a})
                                         .collect::<Vec<String>>()
                                         .join(".");
-                                    if let Ok(a) = ipv4_addr.parse() {
-                                        ipaddr = Some(a);
+                                    if let Ok(ip) = ipv4_addr.parse() {
+                                        let prefix_len = am.header.prefix_len;
+                                        ipaddr = Some(Ipv4Entry { ip, prefix_len });
                                     }
                                 }
                                 _ => {}
