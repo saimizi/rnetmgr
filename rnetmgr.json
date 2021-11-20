@@ -3,7 +3,8 @@
         {
             "ifname" : "br0",
             "iftype" : "Ethernet",
-            "addr_type": "DHCP"
+            "addr_type": "Static",
+            "ipv4" : "192.168.28.23"
         },
         {
             "ifname" : "eth0",

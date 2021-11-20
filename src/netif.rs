@@ -5,18 +5,57 @@ use netlink_packet_route::{
 };
 
 use netlink_sys::protocols::NETLINK_ROUTE;
-use netlink_sys::{Socket, SocketAddr};
+use netlink_sys::SocketAddr;
+use netlink_sys::TokioSocket as Socket;
 #[allow(unused)]
 use rtnl::address::nlas::Nla as AddrNla;
 #[allow(unused)]
 use rtnl::link::nlas::Nla as LinkNla;
 use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
-use std::io::{Error, ErrorKind, Result};
 use std::net::Ipv4Addr;
-use std::thread;
+use tokio::{
+    io::{Error, ErrorKind, Result},
+    sync::mpsc,
+    task,
+};
 
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
+
+pub struct MacAddr {
+    addr: Vec<u8>,
+}
+
+impl Clone for MacAddr {
+    fn clone(&self) -> Self {
+        MacAddr {
+            addr: self.addr.clone(),
+        }
+    }
+}
+
+impl Display for MacAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if !self.addr.is_empty() {
+            let mac_str = self
+                .addr
+                .iter()
+                .map(|a| format!("{:02x}", a))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            write!(f, "{}", mac_str)
+        } else {
+            write!(f, "--:--:--:--:--:--")
+        }
+    }
+}
+
+impl PartialEq for MacAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
+}
 
 #[derive(PartialEq, Eq, Clone, Copy)]
 pub struct Ipv4Entry {
@@ -27,6 +66,89 @@ pub struct Ipv4Entry {
 impl Display for Ipv4Entry {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
         write!(f, "{}/{}", self.ip, self.prefix_len,)
+    }
+}
+
+struct NetInfoNewLINK {
+    ifname: String,
+    if_index: u32,
+    mac: MacAddr,
+    flags: u32,
+}
+
+impl Display for NetInfoNewLINK {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NewLink {} {} {} {:2x}",
+            self.ifname, self.if_index, self.mac, self.flags
+        )
+    }
+}
+
+struct NetInfoDelLINK {
+    ifname: String,
+    if_index: u32,
+    flags: u32,
+}
+
+impl Display for NetInfoDelLINK {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "DelLink {} {} {:2x}",
+            self.ifname, self.if_index, self.flags
+        )
+    }
+}
+
+struct NetInfoNewAddress {
+    ifname: String,
+    if_index: u32,
+    ipv4addr: Ipv4Entry,
+}
+
+impl Display for NetInfoNewAddress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "NewAddr {} {} {}",
+            self.ifname, self.if_index, self.ipv4addr
+        )
+    }
+}
+
+struct NetInfoDelAddress {
+    ifname: String,
+    if_index: u32,
+    ipv4addr: Ipv4Entry,
+}
+
+impl Display for NetInfoDelAddress {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        write!(
+            f,
+            "DelAddr {} {} {}",
+            self.ifname, self.if_index, self.ipv4addr
+        )
+    }
+}
+
+enum NetInfoMessage {
+    NewLink(NetInfoNewLINK),
+    DelLink(NetInfoDelLINK),
+    NewAddress(NetInfoNewAddress),
+    DelAddress(NetInfoDelAddress),
+}
+
+impl Display for NetInfoMessage {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        match self {
+            NetInfoMessage::NewLink(a) => write!(f, "{}", a),
+            NetInfoMessage::DelLink(a) => write!(f, "{}", a),
+            NetInfoMessage::NewAddress(a) => write!(f, "{}", a),
+            NetInfoMessage::DelAddress(a) => write!(f, "{}", a),
+        }
     }
 }
 
@@ -93,7 +215,7 @@ impl NetIfType {
 
 pub struct NetIfRunTime {
     ipv4: Vec<Ipv4Entry>,
-    mac: Vec<u8>,
+    mac: MacAddr,
     flags: u32,
     if_index: u32,
 }
@@ -117,19 +239,7 @@ impl PartialEq for NetIfRunTime {
             return false;
         }
 
-        let mac_s = self
-            .ipv4
-            .iter()
-            .map(|a| format!("{}", a))
-            .collect::<Vec<String>>()
-            .join(":");
-        let mac_o = other
-            .ipv4
-            .iter()
-            .map(|a| format!("{}", a))
-            .collect::<Vec<String>>()
-            .join(":");
-        if mac_s != mac_o {
+        if self.mac != other.mac {
             return false;
         }
 
@@ -156,22 +266,11 @@ impl Display for NetIfRunTime {
             ipv4_str = "None".to_string();
         }
 
-        let mut mac_str = self
-            .mac
-            .iter()
-            .map(|a| format!("{:02x}", a))
-            .collect::<Vec<String>>()
-            .join(":");
-
-        if mac_str.is_empty() {
-            mac_str = "None".to_string();
-        }
-
         write!(
             f,
             "IF_INDEX:{:2} MAC: {:18} IPV4: {:15} [{}]",
             self.if_index,
-            mac_str,
+            self.mac,
             ipv4_str,
             NetIfRunTime::state_flag_str(self.flags).join(" ")
         )
@@ -179,21 +278,12 @@ impl Display for NetIfRunTime {
 }
 
 impl NetIfRunTime {
-    pub fn new(if_index: u32, mac: Option<Vec<u8>>, flags: u32) -> NetIfRunTime {
-        if let Some(mac) = mac {
-            NetIfRunTime {
-                ipv4: Vec::<Ipv4Entry>::new(),
-                mac,
-                flags,
-                if_index,
-            }
-        } else {
-            NetIfRunTime {
-                ipv4: Vec::<Ipv4Entry>::new(),
-                mac: Vec::<u8>::new(),
-                flags,
-                if_index,
-            }
+    pub fn new(if_index: u32, mac: MacAddr, flags: u32) -> NetIfRunTime {
+        NetIfRunTime {
+            ipv4: Vec::<Ipv4Entry>::new(),
+            mac,
+            flags,
+            if_index,
         }
     }
 
@@ -320,11 +410,11 @@ impl NetIf {
         self.state == NetIfState::Established
     }
 
-    pub fn newlink_setup(&self) {
+    pub async fn newlink_setup(&self) {
         fdebug!("Start to setup {}", self.ifname);
         match self.iftype {
             NetIfType::EthernetStaticIpv4(ipv4addr) => {
-                if let Err(e) = self.set_ipv4_addr(ipv4addr) {
+                if let Err(e) = self.set_ipv4_addr(ipv4addr).await {
                     ferror!(
                         "Failed to set up {} with {} : {}",
                         self.ifname,
@@ -368,7 +458,7 @@ impl NetIf {
         r.add_ipv4_addr(ipaddr);
     }
 
-    pub fn unreg_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
+    pub async fn unreg_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
         let mut reset_ip = false;
         let r = match &mut self.runtime {
             Some(r) => r,
@@ -393,11 +483,13 @@ impl NetIf {
         r.del_ipv4_addr(ipaddr);
 
         if reset_ip {
-            self.set_ipv4_addr(ipaddr).unwrap_or(());
+            if let Err(e) = self.set_ipv4_addr(ipaddr).await {
+                fwarn!("failed to reset ipaddr: {}", e);
+            }
         }
     }
 
-    fn set_ipv4_addr(&self, ipaddr: Ipv4Entry) -> Result<()> {
+    async fn set_ipv4_addr(&self, ipaddr: Ipv4Entry) -> Result<()> {
         fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         let r = self
             .runtime
@@ -439,13 +531,13 @@ impl NetIf {
         assert!(buf.len() == packet.buffer_len());
         packet.serialize(&mut buf[..]);
 
-        socket.send(&buf[..], 0)?;
+        socket.send(&buf[..]).await?;
 
         let mut receive_buffer = vec![0; 4096];
         let mut offset = 0;
 
         'main: loop {
-            let size = socket.recv(&mut receive_buffer[..], 0)?;
+            let size = socket.recv(&mut receive_buffer[..]).await?;
 
             loop {
                 let bytes = &receive_buffer[offset..];
@@ -460,7 +552,11 @@ impl NetIf {
 
                     NetlinkPayload::Error(e) => {
                         if let Some(17) = e.to_io().raw_os_error() {
-                            fwarn!("Address {} has already been set for {}.", ipaddr, self.ifname);
+                            fwarn!(
+                                "Address {} has already been set for {}.",
+                                ipaddr,
+                                self.ifname
+                            );
                             break 'main;
                         }
                         return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
@@ -506,7 +602,7 @@ impl Display for NetIfMon {
 impl NetIfMon {
     pub const RTMGRP_LINK: u32 = 0x1;
     pub const RTMGRP_IPV4_IFADDR: u32 = 0x10;
-    pub fn run(nifcfg: NetIfConfig) -> Result<()> {
+    pub async fn run(nifcfg: NetIfConfig) -> Result<()> {
         let mut netif_hash = HashMap::<String, NetIf>::new();
         for cfg in nifcfg.netifs {
             let netif = NetIf {
@@ -531,22 +627,29 @@ impl NetIfMon {
         socket.bind(&addr).unwrap();
         socket.connect(&SocketAddr::new(0, 0))?;
 
-        let handler =
-            thread::spawn(move || -> Result<()> { mon_thread(NetIfMon { socket, netif_hash }) });
+        let mut handlers = vec![];
+        let (s, r) = mpsc::channel(100);
+        handlers.push(task::spawn(async move {
+            mon_thread(NetIfMon { socket, netif_hash }, s).await
+        }));
 
-        if let Err(_e) = handler.join() {
-            ferror!("Error!");
+        handlers.push(task::spawn(async move { info_thread(r).await }));
+
+        for handler in handlers {
+            if let Err(_e) = handler.await {
+                ferror!("Error!");
+            }
         }
 
         Ok(())
     }
 
-    fn update(&mut self) -> Result<()> {
+    async fn update(&mut self, s: &mut mpsc::Sender<Box<NetInfoMessage>>) -> Result<()> {
         let mut receive_buffer = vec![0; 4096];
         let mut offset = 0;
 
         'main: loop {
-            let size = self.socket.recv(&mut receive_buffer[..], 0)?;
+            let size = self.socket.recv(&mut receive_buffer[..]).await?;
 
             loop {
                 let bytes = &receive_buffer[offset..];
@@ -573,7 +676,13 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            ftrace!("DelLink: {}", ifname);
+                            s.send(Box::new(NetInfoMessage::DelLink(NetInfoDelLINK {
+                                ifname: ifname.clone(),
+                                if_index: lm.header.index,
+                                flags: lm.header.flags,
+                            })))
+                            .await
+                            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
                             if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                 n.reset();
                                 fwarn!("{} link disconnected.", n.ifname());
@@ -583,7 +692,7 @@ impl NetIfMon {
 
                     NetlinkPayload::InnerMessage(RtnlMessage::NewLink(lm)) => {
                         let mut ifname = String::new();
-                        let mut mac: Option<Vec<u8>> = None;
+                        let mut mac = MacAddr { addr: vec![] };
                         let flags = lm.header.flags;
                         let if_index = lm.header.index;
 
@@ -593,20 +702,27 @@ impl NetIfMon {
                                     ifname = name.clone();
                                 }
                                 rtnl::link::nlas::Nla::Address(addr) => {
-                                    mac = Some(addr);
+                                    mac = MacAddr { addr };
                                 }
                                 _ => {}
                             }
                         }
 
                         if !ifname.is_empty() {
-                            ftrace!("NewLink: {}", ifname);
+                            s.send(Box::new(NetInfoMessage::NewLink(NetInfoNewLINK {
+                                ifname: ifname.clone(),
+                                if_index: lm.header.index,
+                                mac: mac.clone(),
+                                flags: lm.header.flags,
+                            })))
+                            .await
+                            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
+
                             if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                 /* This may only update flags for established interface */
                                 n.set_runtime(NetIfRunTime::new(if_index, mac, flags))?;
                                 if !n.is_established() {
-                                    fdebug!("{}", n);
-                                    n.newlink_setup();
+                                    n.newlink_setup().await;
                                 }
                             }
                         }
@@ -637,9 +753,17 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
-                                ftrace!("{} Del address {}", ifname, addr);
+                                s.send(Box::new(NetInfoMessage::DelAddress(NetInfoDelAddress {
+                                    ifname: ifname.clone(),
+                                    if_index: am.header.index,
+                                    ipv4addr: addr,
+                                })))
+                                .await
+                                .map_err(|e| {
+                                    Error::new(ErrorKind::InvalidData, format!("{}", e))
+                                })?;
                                 if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                    n.unreg_ipv4_addr(addr);
+                                    n.unreg_ipv4_addr(addr).await;
                                 }
                             }
                         }
@@ -671,14 +795,24 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
-                                ftrace!("{} New address {}", ifname, addr);
+                                s.send(Box::new(NetInfoMessage::NewAddress(NetInfoNewAddress {
+                                    ifname: ifname.clone(),
+                                    if_index: am.header.index,
+                                    ipv4addr: addr,
+                                })))
+                                .await
+                                .map_err(|e| {
+                                    Error::new(ErrorKind::InvalidData, format!("{}", e))
+                                })?;
                                 if let Some(n) = self.netif_hash.get_mut(&ifname) {
                                     n.reg_ipv4_addr(addr);
                                 }
                             }
                         }
                     }
-                    _ => {}
+                    _ => {
+                        fdebug!("Unexpectd msg");
+                    }
                 }
 
                 offset += rx_packet.header.length as usize;
@@ -688,11 +822,15 @@ impl NetIfMon {
                 }
             }
         }
+        ftrace!("Out");
         Ok(())
     }
 }
 
-fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
+async fn mon_thread(
+    mut netif_mon: NetIfMon,
+    mut s: mpsc::Sender<Box<NetInfoMessage>>,
+) -> Result<()> {
     let mut packet = NetlinkMessage {
         header: NetlinkHeader::default(),
         payload: NetlinkPayload::from(RtnlMessage::GetLink(LinkMessage::default())),
@@ -705,9 +843,9 @@ fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     assert!(buf.len() == packet.buffer_len());
     packet.serialize(&mut buf[..]);
 
-    netif_mon.socket.send(&buf[..], 0)?;
-
-    netif_mon.update().unwrap();
+    netif_mon.socket.send(&buf[..]).await?;
+    ftrace!("Send GetLink Message");
+    netif_mon.update(&mut s).await.unwrap();
 
     let mut packet = NetlinkMessage {
         header: NetlinkHeader::default(),
@@ -721,10 +859,20 @@ fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     assert!(buf.len() == packet.buffer_len());
     packet.serialize(&mut buf[..]);
 
-    netif_mon.socket.send(&buf[..], 0)?;
-    netif_mon.update().unwrap();
+    netif_mon.socket.send(&buf[..]).await?;
+    ftrace!("Send GetAddress Message");
+    netif_mon.update(&mut s).await.unwrap();
 
     loop {
-        netif_mon.update().unwrap();
+        ftrace!("Do update");
+        netif_mon.update(&mut s).await.unwrap();
     }
+}
+
+async fn info_thread(mut r: mpsc::Receiver<Box<NetInfoMessage>>) -> Result<()> {
+    while let Some(msg) = r.recv().await {
+        finfo!("{}", msg);
+    }
+
+    Ok(())
 }
