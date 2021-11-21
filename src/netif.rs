@@ -1,6 +1,6 @@
 #[allow(unused)]
 use netlink_packet_route::{
-    rtnl, AddressHeader, AddressMessage, LinkMessage, NetlinkHeader, NetlinkMessage,
+    rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
     NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
 
@@ -339,40 +339,25 @@ impl NetIfRunTime {
     }
 }
 
-#[derive(PartialEq, Eq)]
-pub enum NetIfState {
-    Init,
-    Established,
-}
-
-impl Display for NetIfState {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(
-            f,
-            "{}",
-            match self {
-                NetIfState::Init => "Init".to_string(),
-                NetIfState::Established => "Fini".to_string(),
-            }
-        )
-    }
-}
-
 struct NetIf {
     ifname: String,
     iftype: NetIfType,
-    state: NetIfState,
     runtime: Option<NetIfRunTime>,
 }
 
 impl Display for NetIf {
     fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        let mut state_str = "NOT ESTABLISTED";
+        if self.is_established() {
+            state_str = "ESTABLISTED";
+        }
+
         write!(
             f,
             "IFNAME:{:4} TYPE: {:20} STATE: {:5} {}",
             self.ifname,
             self.iftype.to_string(),
-            self.state.to_string(),
+            state_str,
             match &self.runtime {
                 Some(r) => r.to_string(),
                 None => "None".to_string(),
@@ -403,11 +388,40 @@ impl NetIf {
 
     pub fn reset(&mut self) {
         self.runtime = None;
-        self.state = NetIfState::Init;
     }
 
     pub fn is_established(&self) -> bool {
-        self.state == NetIfState::Established
+        let r = match &self.runtime {
+            Some(r) => r,
+            None => return false,
+        };
+
+        match self.iftype {
+            NetIfType::EthernetDHCP => {
+                if r.flags & rtnl::constants::IFF_UP == 0 {
+                    return false;
+                }
+
+                if r.ipv4.is_empty() {
+                    return false;
+                }
+
+                true
+            }
+
+            NetIfType::EthernetStaticIpv4(addr) => {
+                if r.flags & rtnl::constants::IFF_UP == 0 {
+                    return false;
+                }
+
+                if r.ipv4.iter().any(|&x| x == addr) {
+                    return true;
+                }
+
+                false
+            }
+            NetIfType::Invalid => false,
+        }
     }
 
     pub async fn newlink_setup(&self) {
@@ -416,7 +430,16 @@ impl NetIf {
             NetIfType::EthernetStaticIpv4(ipv4addr) => {
                 if let Err(e) = self.set_ipv4_addr(ipv4addr).await {
                     ferror!(
-                        "Failed to set up {} with {} : {}",
+                        "Failed to set ipv4 address {} with {} : {}",
+                        self.ifname,
+                        self.iftype.to_string(),
+                        e
+                    );
+                }
+
+                if let Err(e) = self.set_netif_updown(true).await {
+                    ferror!(
+                        "Failed to set {} UP with {} : {}",
                         self.ifname,
                         self.iftype.to_string(),
                         e
@@ -439,54 +462,122 @@ impl NetIf {
             None => return,
         };
 
-        if self.state == NetIfState::Init {
-            match self.iftype {
-                NetIfType::EthernetDHCP => {
-                    finfo!("{} established ({})", self.ifname, self.iftype);
-                    self.state = NetIfState::Established;
-                }
-                NetIfType::EthernetStaticIpv4(addr) => {
-                    if addr == ipaddr {
-                        finfo!("{} established ({})", self.ifname, self.iftype);
-                        self.state = NetIfState::Established;
-                    }
-                }
-                _ => {}
-            }
-        }
-
         r.add_ipv4_addr(ipaddr);
     }
 
     pub async fn unreg_ipv4_addr(&mut self, ipaddr: Ipv4Entry) {
-        let mut reset_ip = false;
         let r = match &mut self.runtime {
             Some(r) => r,
             None => return,
         };
 
-        if self.state == NetIfState::Established {
+        r.del_ipv4_addr(ipaddr);
+
+        if !self.is_established() {
             if let NetIfType::EthernetStaticIpv4(addr) = self.iftype {
                 if addr == ipaddr {
-                    self.state = NetIfState::Init;
                     fwarn!(
                         "Static IP address {} for {} is removed, try to reset it",
                         addr.to_string(),
                         self.ifname
                     );
 
-                    reset_ip = true;
+                    if let Err(e) = self.set_ipv4_addr(ipaddr).await {
+                        fwarn!("failed to reset ipaddr: {}", e);
+                    }
                 }
             }
         }
+    }
 
-        r.del_ipv4_addr(ipaddr);
+    async fn set_netif_updown(&self, up: bool) -> Result<()> {
+        let r = self
+            .runtime
+            .as_ref()
+            .ok_or_else(|| Error::new(ErrorKind::InvalidInput, "Interface not created"))?;
+        let mut flags = r.flags;
 
-        if reset_ip {
-            if let Err(e) = self.set_ipv4_addr(ipaddr).await {
-                fwarn!("failed to reset ipaddr: {}", e);
+        if up {
+            fdebug!("Set netif {} UP", self.ifname);
+            flags |= rtnl::constants::IFF_UP;
+        } else {
+            fdebug!("Set netif {} DOWN", self.ifname);
+            flags &= !rtnl::constants::IFF_UP;
+        }
+
+        if flags == r.flags {
+            return Ok(());
+        }
+
+        let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
+        let addr = SocketAddr::new(0, 0);
+        socket.bind(&addr)?;
+        socket.connect(&SocketAddr::new(0, 0))?;
+
+        let header = LinkHeader {
+            interface_family: rtnl::constants::AF_INET as u8,
+            index: r.ifindex(),
+            flags,
+            ..Default::default()
+        };
+
+        let mut packet = NetlinkMessage {
+            header: NetlinkHeader::default(),
+            payload: NetlinkPayload::from(RtnlMessage::SetLink(LinkMessage {
+                header,
+                nlas: vec![],
+            })),
+        };
+
+        packet.header.flags = NLM_F_CREATE | NLM_F_EXCL | NLM_F_REQUEST | NLM_F_ACK;
+        packet.header.sequence_number = 1;
+        packet.finalize();
+
+        let mut buf: Vec<u8> = vec![0; packet.header.length as usize];
+        assert!(buf.len() == packet.buffer_len());
+        packet.serialize(&mut buf[..]);
+
+        socket.send(&buf[..]).await?;
+
+        let mut receive_buffer = vec![0; 4096];
+        let mut offset = 0;
+
+        'main: loop {
+            let size = socket.recv(&mut receive_buffer[..]).await?;
+
+            loop {
+                let bytes = &receive_buffer[offset..];
+                let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
+                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
+
+                match rx_packet.payload {
+                    NetlinkPayload::Done => {
+                        ftrace!("LINK Msge (UP/DOWN): Receive Packet process Done");
+                        break 'main;
+                    }
+
+                    NetlinkPayload::Error(e) => {
+                        return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
+                    }
+
+                    NetlinkPayload::Ack(e) => {
+                        finfo!("Link (UP/DOWN) ACK: {}", e);
+                        break 'main;
+                    }
+
+                    _ => {
+                        fdebug! {"Unknown message"}
+                    }
+                }
+
+                offset += rx_packet.header.length as usize;
+                if offset == size || rx_packet.header.length == 0 {
+                    offset = 0;
+                    break;
+                }
             }
         }
+        Ok(())
     }
 
     async fn set_ipv4_addr(&self, ipaddr: Ipv4Entry) -> Result<()> {
@@ -608,7 +699,6 @@ impl NetIfMon {
             let netif = NetIf {
                 ifname: cfg.ifname.clone(),
                 iftype: NetIfType::from(cfg),
-                state: NetIfState::Init,
                 runtime: None,
             };
 
