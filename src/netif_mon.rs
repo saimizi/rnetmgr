@@ -1,7 +1,7 @@
 use crate::netif::{Ipv4Entry, MacAddr, NetIf};
 #[allow(unused)]
 use crate::netinfo::{
-    NetInfoDelAddress, NetInfoDelLINK, NetInfoMessage, NetInfoNewAddress, NetInfoNewLINK,
+    NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
 };
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
@@ -18,6 +18,8 @@ use tokio::{
     io::{Error, ErrorKind, Result},
     task,
 };
+
+use crate::netinfo::NetInfo;
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -84,6 +86,7 @@ pub struct NetIfMon {
     socket: Socket,
     netif_hash: HashMap<String, NetIf>,
     netiftype_hash: HashMap<String, NetIfType>,
+    netinfo: NetInfo,
 }
 
 impl Display for NetIfMon {
@@ -118,11 +121,13 @@ impl NetIfMon {
         socket.connect(&SocketAddr::new(0, 0))?;
 
         let mut handlers = vec![];
+
         handlers.push(task::spawn(async move {
             mon_thread(NetIfMon {
                 socket,
                 netif_hash: HashMap::<String, NetIf>::new(),
                 netiftype_hash,
+                netinfo: NetInfo::new(),
             })
             .await
         }));
@@ -168,7 +173,18 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            ftrace!("DelLink: {}", ifname);
+                            if let Err(e) = self
+                                .netinfo
+                                .send(NetInfoMessage::DelLink(NetInfoDelLink {
+                                    ifname: ifname.clone(),
+                                    if_index: lm.header.index,
+                                    flags: lm.header.flags,
+                                }))
+                                .await
+                            {
+                                ferror!("Netinfo send error: {}", e);
+                            }
+
                             self.netif_hash.retain(|k, _v| k != &ifname);
                         }
                     }
@@ -192,8 +208,20 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
+                            if let Err(e) = self
+                                .netinfo
+                                .send(NetInfoMessage::NewLink(NetInfoNewLink {
+                                    ifname: ifname.clone(),
+                                    if_index: lm.header.index,
+                                    mac: mac.clone(),
+                                    flags: lm.header.flags,
+                                }))
+                                .await
+                            {
+                                ferror!("Netinfo send error: {}", e);
+                            }
+
                             let netif = NetIf::new(&ifname, if_index, mac, flags);
-                            ftrace!("Newlink: {}", netif);
                             self.netif_hash.insert(netif.ifname(), netif);
 
                             if let Some(NetIfType::EthernetStaticIpv4(addr)) =
@@ -245,9 +273,19 @@ impl NetIfMon {
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
                                 if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                    n.del_ipv4_addr(&addr);
-                                    ftrace!("DelAddress: del {} from {}", addr, ifname);
+                                    if let Err(e) = self
+                                        .netinfo
+                                        .send(NetInfoMessage::DelAddress(NetInfoDelAddress {
+                                            ifname: ifname.clone(),
+                                            if_index: n.if_index(),
+                                            ipv4addr: addr.clone(),
+                                        }))
+                                        .await
+                                    {
+                                        ferror!("Netinfo send error: {}", e);
+                                    }
 
+                                    n.del_ipv4_addr(&addr);
                                     if let Some(NetIfType::EthernetStaticIpv4(addr_s)) =
                                         self.netiftype_hash.get(&ifname)
                                     {
@@ -310,8 +348,19 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
-                                ftrace!("NewAddress: add {} to {}", addr, ifname);
                                 if let Some(n) = self.netif_hash.get_mut(&ifname) {
+                                    if let Err(e) = self
+                                        .netinfo
+                                        .send(NetInfoMessage::NewAddress(NetInfoNewAddress {
+                                            ifname: ifname.clone(),
+                                            if_index: n.if_index(),
+                                            ipv4addr: addr.clone(),
+                                        }))
+                                        .await
+                                    {
+                                        ferror!("Netinfo send error: {}", e);
+                                    }
+
                                     n.add_ipv4_addr(&addr);
                                 } else {
                                     fwarn!("NewAddress: netif {} is not found.", ifname);

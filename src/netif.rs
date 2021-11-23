@@ -17,9 +17,12 @@ use std::fmt::{self, Display, Formatter};
 use std::net::Ipv4Addr;
 use tokio::io::{Error, ErrorKind, Result};
 
+use serde_derive::{Deserialize, Serialize};
+
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
 
+#[derive(Serialize, Deserialize, Debug)]
 pub struct MacAddr {
     pub addr: Vec<u8>,
 }
@@ -63,7 +66,7 @@ impl PartialEq for MacAddr {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy)]
+#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
 pub struct Ipv4Entry {
     pub ip: Ipv4Addr,
     pub prefix_len: u8,
@@ -174,6 +177,10 @@ impl NetIf {
 
     pub fn ifname(&self) -> String {
         self.ifname.clone()
+    }
+
+    pub fn if_index(&self) -> u32 {
+        self.if_index
     }
 
     pub fn state_flag_str(flags: u32) -> Vec<String> {
