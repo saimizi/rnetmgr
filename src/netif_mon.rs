@@ -5,6 +5,7 @@ use crate::netinfo::{
 };
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
+use bytes::Bytes;
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
@@ -19,7 +20,14 @@ use tokio::{
     task,
 };
 
-use crate::netinfo::NetInfo;
+#[cfg(feature = "netinfo-ipcon")]
+use ipcon_sys::{
+    ipcon::{IPF_RCV_IF, IPF_SND_IF},
+    ipcon_async::AsyncIpcon,
+};
+
+#[cfg(feature = "netinfo-ipcon")]
+const NETINFO_IPCON_GROUP: &'static str = "netinfo";
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -86,7 +94,8 @@ pub struct NetIfMon {
     socket: Socket,
     netif_hash: HashMap<String, NetIf>,
     netiftype_hash: HashMap<String, NetIfType>,
-    netinfo: NetInfo,
+    #[cfg(feature = "netinfo-ipcon")]
+    ih: AsyncIpcon,
 }
 
 impl Display for NetIfMon {
@@ -122,12 +131,20 @@ impl NetIfMon {
 
         let mut handlers = vec![];
 
+        cfg_if::cfg_if! {
+            if #[cfg(feature = "netinfo-ipcon")] {
+                let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)).unwrap();
+                ih.register_group(NETINFO_IPCON_GROUP).await?;
+            }
+        }
+
         handlers.push(task::spawn(async move {
             mon_thread(NetIfMon {
                 socket,
                 netif_hash: HashMap::<String, NetIf>::new(),
                 netiftype_hash,
-                netinfo: NetInfo::new(),
+                #[cfg(feature = "netinfo-ipcon")]
+                ih,
             })
             .await
         }));
@@ -139,6 +156,16 @@ impl NetIfMon {
         }
 
         Ok(())
+    }
+
+    #[cfg(feature = "netinfo-ipcon")]
+    async fn send_netinfo_ipcon_msg(&self, msg: NetInfoMessage) -> Result<()> {
+        let buf = serde_json::to_string(&msg)
+            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialze error: {}", e)))?;
+
+        self.ih
+            .send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
+            .await
     }
 
     async fn update(&mut self) -> Result<()> {
@@ -173,16 +200,17 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            if let Err(e) = self
-                                .netinfo
-                                .send(NetInfoMessage::DelLink(NetInfoDelLink {
+                            {
+                                let msg = NetInfoMessage::DelLink(NetInfoDelLink {
                                     ifname: ifname.clone(),
                                     if_index: lm.header.index,
                                     flags: lm.header.flags,
-                                }))
-                                .await
-                            {
-                                ferror!("Netinfo send error: {}", e);
+                                });
+
+                                fdebug!("{}", msg);
+
+                                #[cfg(feature = "netinfo-ipcon")]
+                                self.send_netinfo_ipcon_msg(msg).await;
                             }
 
                             self.netif_hash.retain(|k, _v| k != &ifname);
@@ -208,17 +236,18 @@ impl NetIfMon {
                         }
 
                         if !ifname.is_empty() {
-                            if let Err(e) = self
-                                .netinfo
-                                .send(NetInfoMessage::NewLink(NetInfoNewLink {
+                            {
+                                let msg = NetInfoMessage::NewLink(NetInfoNewLink {
                                     ifname: ifname.clone(),
                                     if_index: lm.header.index,
                                     mac: mac.clone(),
                                     flags: lm.header.flags,
-                                }))
-                                .await
-                            {
-                                ferror!("Netinfo send error: {}", e);
+                                });
+
+                                fdebug!("{}", msg);
+
+                                #[cfg(feature = "netinfo-ipcon")]
+                                self.send_netinfo_ipcon_msg(msg).await;
                             }
 
                             let netif = NetIf::new(&ifname, if_index, mac, flags);
@@ -272,51 +301,52 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
-                                if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                    if let Err(e) = self
-                                        .netinfo
-                                        .send(NetInfoMessage::DelAddress(NetInfoDelAddress {
-                                            ifname: ifname.clone(),
-                                            if_index: n.if_index(),
-                                            ipv4addr: addr.clone(),
-                                        }))
-                                        .await
-                                    {
-                                        ferror!("Netinfo send error: {}", e);
-                                    }
+                                let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::Other,
+                                        format!("DelAddress: netif {} is not found.", ifname),
+                                    )
+                                })?;
 
-                                    n.del_ipv4_addr(&addr);
-                                    if let Some(NetIfType::EthernetStaticIpv4(addr_s)) =
-                                        self.netiftype_hash.get(&ifname)
-                                    {
-                                        if addr_s == &addr {
-                                            fwarn!(
-                                                "{} is removed from {}, try to reset it.",
+                                n.del_ipv4_addr(&addr);
+
+                                let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
+                                    ifname: ifname.clone(),
+                                    if_index: n.if_index(),
+                                    ipv4addr: addr,
+                                });
+
+                                fdebug!("{}", msg);
+
+                                #[cfg(feature = "netinfo-ipcon")]
+                                self.send_netinfo_ipcon_msg(msg).await;
+
+                                if let Some(NetIfType::EthernetStaticIpv4(addr_s)) =
+                                    self.netiftype_hash.get(&ifname)
+                                {
+                                    if addr_s == &addr {
+                                        fwarn!(
+                                            "{} is removed from {}, try to reset it.",
+                                            addr,
+                                            ifname
+                                        );
+
+                                        let netif = self.netif_hash.get_mut(&ifname).unwrap();
+                                        /*
+                                         * set_ipv4_addr() will return Ok(()) directly if the ip
+                                         * address has been set
+                                         */
+                                        if let Err(e) = netif.set_ipv4_addr(&addr).await {
+                                            ferror!(
+                                                "Failed to set ip address {} to {}: {}",
                                                 addr,
-                                                ifname
+                                                ifname,
+                                                e
                                             );
-
-                                            let netif = self.netif_hash.get_mut(&ifname).unwrap();
-                                            /*
-                                             * set_ipv4_addr() will return Ok(()) directly if the ip
-                                             * address has been set
-                                             */
-                                            if let Err(e) = netif.set_ipv4_addr(&addr).await {
-                                                ferror!(
-                                                    "Failed to set ip address {} to {}: {}",
-                                                    addr,
-                                                    ifname,
-                                                    e
-                                                );
-                                            } else if let Err(e) =
-                                                netif.set_netif_updown(true).await
-                                            {
-                                                ferror!("Failed to set {} UP: {}", ifname, e);
-                                            }
+                                        } else if let Err(e) = netif.set_netif_updown(true).await {
+                                            ferror!("Failed to set {} UP: {}", ifname, e);
                                         }
                                     }
-                                } else {
-                                    fwarn!("DelAddress: netif {} is not found.", ifname);
                                 }
                             }
                         }
@@ -348,23 +378,24 @@ impl NetIfMon {
 
                         if !ifname.is_empty() {
                             if let Some(addr) = ipaddr {
-                                if let Some(n) = self.netif_hash.get_mut(&ifname) {
-                                    if let Err(e) = self
-                                        .netinfo
-                                        .send(NetInfoMessage::NewAddress(NetInfoNewAddress {
-                                            ifname: ifname.clone(),
-                                            if_index: n.if_index(),
-                                            ipv4addr: addr.clone(),
-                                        }))
-                                        .await
-                                    {
-                                        ferror!("Netinfo send error: {}", e);
-                                    }
+                                let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
+                                    Error::new(
+                                        ErrorKind::Other,
+                                        format!("NewAddress: netif {} is not found.", ifname),
+                                    )
+                                })?;
+                                n.add_ipv4_addr(&addr);
 
-                                    n.add_ipv4_addr(&addr);
-                                } else {
-                                    fwarn!("NewAddress: netif {} is not found.", ifname);
-                                }
+                                let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
+                                    ifname: ifname.clone(),
+                                    if_index: n.if_index(),
+                                    ipv4addr: addr,
+                                });
+
+                                fdebug!("{}", msg);
+
+                                #[cfg(feature = "netinfo-ipcon")]
+                                self.send_netinfo_ipcon_msg(msg).await;
                             }
                         }
                     }
