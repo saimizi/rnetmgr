@@ -1,10 +1,12 @@
 mod logger;
 mod netif;
+mod netinfo;
+mod netif_mon;
 
 use clap::{App, Arg};
 use log::LevelFilter;
 use logger::js_logger_init;
-use netif::NetIfMon;
+use netif_mon::NetIfMon;
 use serde_derive::{Deserialize, Serialize};
 use std::fs;
 
