@@ -28,6 +28,7 @@ fn main() {
         .thread_stack_size(3 * 1024 * 1024)
         .enable_io()
         .enable_time()
+        .thread_name("tokio-rnetmgr")
         .build()
         .unwrap();
 

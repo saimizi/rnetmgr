@@ -2,8 +2,6 @@ use crate::netif::{Ipv4Entry, MacAddr};
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-
-
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
 
@@ -82,6 +80,7 @@ pub enum NetInfoMessage {
     DelLink(NetInfoDelLink),
     NewAddress(NetInfoNewAddress),
     DelAddress(NetInfoDelAddress),
+    NoInfo,
 }
 
 impl Display for NetInfoMessage {
@@ -91,7 +90,13 @@ impl Display for NetInfoMessage {
             NetInfoMessage::DelLink(a) => write!(f, "{}", a),
             NetInfoMessage::NewAddress(a) => write!(f, "{}", a),
             NetInfoMessage::DelAddress(a) => write!(f, "{}", a),
+            NetInfoMessage::NoInfo => write!(f, "none"),
         }
     }
 }
 
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub enum NetInfoReqMessage {
+    ReqLink(String),
+    ReqAddress(String),
+}

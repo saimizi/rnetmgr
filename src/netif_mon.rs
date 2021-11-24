@@ -2,10 +2,11 @@ use crate::netif::{Ipv4Entry, MacAddr, NetIf};
 #[allow(unused)]
 use crate::netinfo::{
     NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
+    NetInfoReqMessage,
 };
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
-use bytes::Bytes;
+
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
@@ -17,6 +18,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use tokio::{
     io::{Error, ErrorKind, Result},
+    sync::mpsc::{self, Receiver, Sender},
     task,
 };
 
@@ -24,7 +26,11 @@ use tokio::{
 use ipcon_sys::{
     ipcon::{IPF_RCV_IF, IPF_SND_IF},
     ipcon_async::AsyncIpcon,
+    ipcon_msg::IpconMsg,
 };
+
+#[cfg(feature = "netinfo-ipcon")]
+use bytes::Bytes;
 
 #[cfg(feature = "netinfo-ipcon")]
 const NETINFO_IPCON_GROUP: &'static str = "netinfo";
@@ -91,11 +97,8 @@ impl NetIfType {
 }
 
 pub struct NetIfMon {
-    socket: Socket,
     netif_hash: HashMap<String, NetIf>,
     netiftype_hash: HashMap<String, NetIfType>,
-    #[cfg(feature = "netinfo-ipcon")]
-    ih: AsyncIpcon,
 }
 
 impl Display for NetIfMon {
@@ -124,28 +127,15 @@ impl NetIfMon {
             netiftype_hash.insert(cfg.ifname.clone(), netif_type);
         }
 
-        let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
-        let addr = SocketAddr::new(0, NetIfMon::RTMGRP_LINK | NetIfMon::RTMGRP_IPV4_IFADDR);
-        socket.bind(&addr).unwrap();
-        socket.connect(&SocketAddr::new(0, 0))?;
-
         let mut handlers = vec![];
 
-        cfg_if::cfg_if! {
-            if #[cfg(feature = "netinfo-ipcon")] {
-                let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)).unwrap();
-                ih.register_group(NETINFO_IPCON_GROUP).await?;
-            }
-        }
-
         handlers.push(task::spawn(async move {
-            mon_thread(NetIfMon {
-                socket,
-                netif_hash: HashMap::<String, NetIf>::new(),
-                netiftype_hash,
-                #[cfg(feature = "netinfo-ipcon")]
-                ih,
-            })
+            mon_thread(
+                NetIfMon {
+                    netif_hash: HashMap::<String, NetIf>::new(),
+                    netiftype_hash,
+                },
+            )
             .await
         }));
 
@@ -159,264 +149,376 @@ impl NetIfMon {
     }
 
     #[cfg(feature = "netinfo-ipcon")]
-    async fn send_netinfo_ipcon_msg(&self, msg: NetInfoMessage) -> Result<()> {
+    async fn send_netinfo_ipcon_msg(
+        ih: &AsyncIpcon,
+        peer: Option<String>,
+        msg: NetInfoMessage,
+    ) -> Result<()> {
         let buf = serde_json::to_string(&msg)
             .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialze error: {}", e)))?;
 
-        self.ih
-            .send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
-            .await
+        fdebug!("{}", buf);
+        if let Some(p) = peer {
+            ih.send_unicast_msg(&p, Bytes::from(buf)).await
+        } else {
+            ih.send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
+                .await
+        }
     }
 
-    async fn update(&mut self) -> Result<()> {
-        let mut receive_buffer = vec![0; 4096];
+    #[cfg(feature = "netinfo-ipcon")]
+    async fn recv_netinfo_ipcon_msg(ih: &AsyncIpcon) -> Result<(String, NetInfoReqMessage)> {
+        let ipcon_msg = ih.receive_msg().await?;
+        if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
+            let s = std::str::from_utf8(&body.buf)
+                .map_err(|e| Error::new(ErrorKind::InvalidData, "Invalid data"))?;
+            if let Ok(req) = serde_json::from_str::<NetInfoReqMessage>(s) {
+                return Ok((body.peer.clone(), req));
+            }
+        }
+
+        return Err(Error::new(
+            ErrorKind::InvalidData,
+            "Invalid NetInfoReqMessage",
+        ));
+    }
+
+    async fn update(
+        &mut self,
+        buf: Vec<u8>,
+        size: usize,
+        mut sender: Option<&mut Sender<NetInfoMessage>>,
+    ) -> Result<bool> {
         let mut offset = 0;
 
-        'main: loop {
-            let size = self.socket.recv(&mut receive_buffer[..]).await?;
+        loop {
+            let bytes = &buf[offset..];
 
-            loop {
-                let bytes = &receive_buffer[offset..];
+            let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
+                .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
 
-                let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
+            match rx_packet.payload {
+                NetlinkPayload::Done => {
+                    return Ok(true);
+                }
+                NetlinkPayload::Error(e) => {
+                    ferror!("Error: {}", e);
+                    return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
+                }
+                NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
+                    let mut ifname = String::new();
 
-                match rx_packet.payload {
-                    NetlinkPayload::Done => {
-                        ftrace!("Packet process Done");
-                        break 'main;
-                    }
-                    NetlinkPayload::Error(e) => {
-                        ferror!("Error: {}", e);
-                        return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
-                    }
-                    NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
-                        let mut ifname = String::new();
-
-                        for nla in lm.nlas {
-                            if let rtnl::link::nlas::Nla::IfName(name) = nla {
-                                ifname = name;
-                            }
-                        }
-
-                        if !ifname.is_empty() {
-                            {
-                                let msg = NetInfoMessage::DelLink(NetInfoDelLink {
-                                    ifname: ifname.clone(),
-                                    if_index: lm.header.index,
-                                    flags: lm.header.flags,
-                                });
-
-                                fdebug!("{}", msg);
-
-                                #[cfg(feature = "netinfo-ipcon")]
-                                self.send_netinfo_ipcon_msg(msg).await;
-                            }
-
-                            self.netif_hash.retain(|k, _v| k != &ifname);
+                    for nla in lm.nlas {
+                        if let rtnl::link::nlas::Nla::IfName(name) = nla {
+                            ifname = name;
                         }
                     }
 
-                    NetlinkPayload::InnerMessage(RtnlMessage::NewLink(lm)) => {
-                        let mut ifname = String::new();
-                        let mut mac = MacAddr { addr: vec![] };
-                        let flags = lm.header.flags;
-                        let if_index = lm.header.index;
+                    if !ifname.is_empty() {
+                        {
+                            let msg = NetInfoMessage::DelLink(NetInfoDelLink {
+                                ifname: ifname.clone(),
+                                if_index: lm.header.index,
+                                flags: lm.header.flags,
+                            });
 
-                        for nla in lm.nlas {
-                            match nla {
-                                rtnl::link::nlas::Nla::IfName(name) => {
-                                    ifname = name.clone();
-                                }
-                                rtnl::link::nlas::Nla::Address(addr) => {
-                                    mac = MacAddr { addr };
-                                }
-                                _ => {}
-                            }
-                        }
+                            fdebug!("{}", msg);
 
-                        if !ifname.is_empty() {
-                            {
-                                let msg = NetInfoMessage::NewLink(NetInfoNewLink {
-                                    ifname: ifname.clone(),
-                                    if_index: lm.header.index,
-                                    mac: mac.clone(),
-                                    flags: lm.header.flags,
-                                });
-
-                                fdebug!("{}", msg);
-
-                                #[cfg(feature = "netinfo-ipcon")]
-                                self.send_netinfo_ipcon_msg(msg).await;
-                            }
-
-                            let netif = NetIf::new(&ifname, if_index, mac, flags);
-                            self.netif_hash.insert(netif.ifname(), netif);
-
-                            if let Some(NetIfType::EthernetStaticIpv4(addr)) =
-                                self.netiftype_hash.get(&ifname)
-                            {
-                                let netif = self.netif_hash.get_mut(&ifname).unwrap();
-                                /*
-                                 * set_ipv4_addr() will return Ok(()) directly if the ip
-                                 * address has been set
-                                 */
-                                if let Err(e) = netif.set_ipv4_addr(addr).await {
-                                    ferror!(
-                                        "Failed to set ip address {} to {}: {}",
-                                        addr,
-                                        ifname,
-                                        e
-                                    );
-                                } else if let Err(e) = netif.set_netif_updown(true).await {
-                                    ferror!("Failed to set {} UP: {}", ifname, e);
+                            if let Some(s) = &mut sender {
+                                if let Err(e) = s.send(msg).await {
+                                    ferror!("MPSC send error: {}", e);
                                 }
                             }
                         }
-                    }
 
-                    NetlinkPayload::InnerMessage(RtnlMessage::DelAddress(am)) => {
-                        let mut ifname = String::new();
-                        let mut ipaddr: Option<Ipv4Entry> = None;
-
-                        for nla in am.nlas {
-                            match nla {
-                                rtnl::address::nlas::Nla::Label(l) => {
-                                    ifname = l.clone();
-                                }
-                                rtnl::address::nlas::Nla::Address(addr) => {
-                                    let ipv4_addr = addr
-                                        .iter()
-                                        .map(|a| format! {"{}", a})
-                                        .collect::<Vec<String>>()
-                                        .join(".");
-                                    if let Ok(ip) = ipv4_addr.parse() {
-                                        let prefix_len = am.header.prefix_len;
-                                        ipaddr = Some(Ipv4Entry { ip, prefix_len });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if !ifname.is_empty() {
-                            if let Some(addr) = ipaddr {
-                                let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
-                                    Error::new(
-                                        ErrorKind::Other,
-                                        format!("DelAddress: netif {} is not found.", ifname),
-                                    )
-                                })?;
-
-                                n.del_ipv4_addr(&addr);
-
-                                let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
-                                    ifname: ifname.clone(),
-                                    if_index: n.if_index(),
-                                    ipv4addr: addr,
-                                });
-
-                                fdebug!("{}", msg);
-
-                                #[cfg(feature = "netinfo-ipcon")]
-                                self.send_netinfo_ipcon_msg(msg).await;
-
-                                if let Some(NetIfType::EthernetStaticIpv4(addr_s)) =
-                                    self.netiftype_hash.get(&ifname)
-                                {
-                                    if addr_s == &addr {
-                                        fwarn!(
-                                            "{} is removed from {}, try to reset it.",
-                                            addr,
-                                            ifname
-                                        );
-
-                                        let netif = self.netif_hash.get_mut(&ifname).unwrap();
-                                        /*
-                                         * set_ipv4_addr() will return Ok(()) directly if the ip
-                                         * address has been set
-                                         */
-                                        if let Err(e) = netif.set_ipv4_addr(&addr).await {
-                                            ferror!(
-                                                "Failed to set ip address {} to {}: {}",
-                                                addr,
-                                                ifname,
-                                                e
-                                            );
-                                        } else if let Err(e) = netif.set_netif_updown(true).await {
-                                            ferror!("Failed to set {} UP: {}", ifname, e);
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                    }
-
-                    NetlinkPayload::InnerMessage(RtnlMessage::NewAddress(am)) => {
-                        let mut ifname = String::new();
-                        let mut ipaddr: Option<Ipv4Entry> = None;
-
-                        for nla in am.nlas {
-                            match nla {
-                                rtnl::address::nlas::Nla::Label(l) => {
-                                    ifname = l.clone();
-                                }
-                                rtnl::address::nlas::Nla::Address(addr) => {
-                                    let ipv4_addr = addr
-                                        .iter()
-                                        .map(|a| format! {"{}", a})
-                                        .collect::<Vec<String>>()
-                                        .join(".");
-                                    if let Ok(ip) = ipv4_addr.parse() {
-                                        let prefix_len = am.header.prefix_len;
-                                        ipaddr = Some(Ipv4Entry { ip, prefix_len });
-                                    }
-                                }
-                                _ => {}
-                            }
-                        }
-
-                        if !ifname.is_empty() {
-                            if let Some(addr) = ipaddr {
-                                let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
-                                    Error::new(
-                                        ErrorKind::Other,
-                                        format!("NewAddress: netif {} is not found.", ifname),
-                                    )
-                                })?;
-                                n.add_ipv4_addr(&addr);
-
-                                let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
-                                    ifname: ifname.clone(),
-                                    if_index: n.if_index(),
-                                    ipv4addr: addr,
-                                });
-
-                                fdebug!("{}", msg);
-
-                                #[cfg(feature = "netinfo-ipcon")]
-                                self.send_netinfo_ipcon_msg(msg).await;
-                            }
-                        }
-                    }
-                    _ => {
-                        fdebug!("Unexpectd msg");
+                        self.netif_hash.retain(|k, _v| k != &ifname);
                     }
                 }
 
-                offset += rx_packet.header.length as usize;
-                if offset == size || rx_packet.header.length == 0 {
-                    offset = 0;
-                    break;
+                NetlinkPayload::InnerMessage(RtnlMessage::NewLink(lm)) => {
+                    let mut ifname = String::new();
+                    let mut mac = MacAddr { addr: vec![] };
+                    let flags = lm.header.flags;
+                    let if_index = lm.header.index;
+
+                    for nla in lm.nlas {
+                        match nla {
+                            rtnl::link::nlas::Nla::IfName(name) => {
+                                ifname = name.clone();
+                            }
+                            rtnl::link::nlas::Nla::Address(addr) => {
+                                mac = MacAddr { addr };
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !ifname.is_empty() {
+                        {
+                            let msg = NetInfoMessage::NewLink(NetInfoNewLink {
+                                ifname: ifname.clone(),
+                                if_index: lm.header.index,
+                                mac: mac.clone(),
+                                flags: lm.header.flags,
+                            });
+
+                            fdebug!("{}", msg);
+
+                            if let Some(s) = &mut sender {
+                                if let Err(e) = s.send(msg).await {
+                                    ferror!("MPSC send error: {}", e);
+                                }
+                            }
+                        }
+
+                        let netif = NetIf::new(&ifname, if_index, mac, flags);
+                        self.netif_hash.insert(netif.ifname(), netif);
+
+                        if let Some(NetIfType::EthernetStaticIpv4(addr)) =
+                            self.netiftype_hash.get(&ifname)
+                        {
+                            let netif = self.netif_hash.get_mut(&ifname).unwrap();
+                            /*
+                             * set_ipv4_addr() will return Ok(()) directly if the ip
+                             * address has been set
+                             */
+                            if let Err(e) = netif.set_ipv4_addr(addr).await {
+                                ferror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
+                            } else if let Err(e) = netif.set_netif_updown(true).await {
+                                ferror!("Failed to set {} UP: {}", ifname, e);
+                            }
+                        }
+                    }
+                }
+
+                NetlinkPayload::InnerMessage(RtnlMessage::DelAddress(am)) => {
+                    let mut ifname = String::new();
+                    let mut ipaddr: Option<Ipv4Entry> = None;
+
+                    for nla in am.nlas {
+                        match nla {
+                            rtnl::address::nlas::Nla::Label(l) => {
+                                ifname = l.clone();
+                            }
+                            rtnl::address::nlas::Nla::Address(addr) => {
+                                let ipv4_addr = addr
+                                    .iter()
+                                    .map(|a| format! {"{}", a})
+                                    .collect::<Vec<String>>()
+                                    .join(".");
+                                if let Ok(ip) = ipv4_addr.parse() {
+                                    let prefix_len = am.header.prefix_len;
+                                    ipaddr = Some(Ipv4Entry { ip, prefix_len });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !ifname.is_empty() {
+                        if let Some(addr) = ipaddr {
+                            let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::Other,
+                                    format!("DelAddress: netif {} is not found.", ifname),
+                                )
+                            })?;
+
+                            n.del_ipv4_addr(&addr);
+
+                            let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
+                                ifname: ifname.clone(),
+                                if_index: n.if_index(),
+                                ipv4addr: addr,
+                            });
+
+                            fdebug!("{}", msg);
+
+                            if let Some(s) = &mut sender {
+                                if let Err(e) = s.send(msg).await {
+                                    ferror!("MPSC send error: {}", e);
+                                }
+                            }
+
+                            if let Some(NetIfType::EthernetStaticIpv4(addr_s)) =
+                                self.netiftype_hash.get(&ifname)
+                            {
+                                if addr_s == &addr {
+                                    fwarn!("{} is removed from {}, try to reset it.", addr, ifname);
+
+                                    let netif = self.netif_hash.get_mut(&ifname).unwrap();
+                                    /*
+                                     * set_ipv4_addr() will return Ok(()) directly if the ip
+                                     * address has been set
+                                     */
+                                    if let Err(e) = netif.set_ipv4_addr(&addr).await {
+                                        ferror!(
+                                            "Failed to set ip address {} to {}: {}",
+                                            addr,
+                                            ifname,
+                                            e
+                                        );
+                                    } else if let Err(e) = netif.set_netif_updown(true).await {
+                                        ferror!("Failed to set {} UP: {}", ifname, e);
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+
+                NetlinkPayload::InnerMessage(RtnlMessage::NewAddress(am)) => {
+                    let mut ifname = String::new();
+                    let mut ipaddr: Option<Ipv4Entry> = None;
+
+                    for nla in am.nlas {
+                        match nla {
+                            rtnl::address::nlas::Nla::Label(l) => {
+                                ifname = l.clone();
+                            }
+                            rtnl::address::nlas::Nla::Address(addr) => {
+                                let ipv4_addr = addr
+                                    .iter()
+                                    .map(|a| format! {"{}", a})
+                                    .collect::<Vec<String>>()
+                                    .join(".");
+                                if let Ok(ip) = ipv4_addr.parse() {
+                                    let prefix_len = am.header.prefix_len;
+                                    ipaddr = Some(Ipv4Entry { ip, prefix_len });
+                                }
+                            }
+                            _ => {}
+                        }
+                    }
+
+                    if !ifname.is_empty() {
+                        if let Some(addr) = ipaddr {
+                            let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
+                                Error::new(
+                                    ErrorKind::Other,
+                                    format!("NewAddress: netif {} is not found.", ifname),
+                                )
+                            })?;
+                            n.add_ipv4_addr(&addr);
+
+                            let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
+                                ifname: ifname.clone(),
+                                if_index: n.if_index(),
+                                ipv4addr: addr,
+                            });
+
+                            fdebug!("{}", msg);
+
+                            if let Some(s) = &mut sender {
+                                if let Err(e) = s.send(msg).await {
+                                    ferror!("MPSC send error: {}", e);
+                                }
+                            }
+                        }
+                    }
+                }
+                _ => {
+                    fdebug!("Unexpectd msg");
+                }
+            }
+
+            offset += rx_packet.header.length as usize;
+            if offset == size || rx_packet.header.length == 0 {
+                break;
+            }
+        }
+        Ok(false)
+    }
+
+    async fn recv_netlink_msg(socket: &mut Socket) -> Result<(Vec<u8>, usize)> {
+        let mut buf = vec![0; 4096];
+        let size = socket.recv(buf.as_mut()).await?;
+        Ok((buf, size))
+    }
+
+    #[cfg(not(feature = "netinfo-ipcon"))]
+    async fn monitor(
+        &mut self,
+        socket: &mut Socket,
+        mut s: Sender<NetInfoMessage>,
+        mut r: Receiver<NetInfoMessage>,
+    ) -> Result<()> {
+        loop {
+            tokio::select! {
+                Ok((buf, size)) =  NetIfMon::recv_netlink_msg(socket) => {
+                    if let Err(e) = self.update(buf, size, Some(&mut s)).await {
+                        ferror!("{}", e);
+                    }
+                }
+                Some(m)= r.recv() => {
+                    finfo!("{}",m);
                 }
             }
         }
-        ftrace!("Out");
-        Ok(())
+    }
+
+    #[cfg(feature = "netinfo-ipcon")]
+    async fn monitor(
+        &mut self,
+        socket: &mut Socket,
+        ih: AsyncIpcon,
+        mut s: Sender<NetInfoMessage>,
+        mut r: Receiver<NetInfoMessage>,
+    ) -> Result<()> {
+        loop {
+            tokio::select! {
+                Ok((buf, size)) =  NetIfMon::recv_netlink_msg(socket) => {
+                    if let Err(e) = self.update(buf, size, Some(&mut s)).await {
+                        ferror!("{}", e);
+                    }
+                }
+                Some(m)= r.recv() => {
+                    if let Err(e) = NetIfMon::send_netinfo_ipcon_msg(&ih, None, m).await {
+                        ferror!("{}", e);
+                    }
+                }
+                Ok((peer, m)) = NetIfMon::recv_netinfo_ipcon_msg(&ih) => {
+                    match m {
+                        NetInfoReqMessage::ReqLink(s) => {
+                            let mut m = NetInfoMessage::NoInfo;
+                            if let Some(nif) = self.netif_hash.get(&s) {
+                                m = NetInfoMessage::NewLink(NetInfoNewLink{
+                                    ifname:nif.ifname(),
+                                    if_index: nif.if_index(),
+                                    mac: nif.mac().clone(),
+                                    flags: nif.flags() });
+                            }
+
+                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                        }
+                        NetInfoReqMessage::ReqAddress(s) => {
+                            let mut m = NetInfoMessage::NoInfo;
+                            if let Some(nif) = self.netif_hash.get(&s) {
+                                if let Some(ipv4addr) = nif.primary_ipv4addr() {
+                                    m = NetInfoMessage::NewAddress(NetInfoNewAddress{
+                                        ifname:nif.ifname(),
+                                        if_index: nif.if_index(),
+                                        ipv4addr});
+                                }
+                            }
+                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                        }
+                    }
+                }
+
+            }
+        }
     }
 }
 
 async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
+    let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let addr = SocketAddr::new(0,0);
+    socket.bind(&addr).unwrap();
+    socket.connect(&SocketAddr::new(0, 0))?;
+
+    let (mut s, r) = mpsc::channel(100);
+
     let mut packet = NetlinkMessage {
         header: NetlinkHeader::default(),
         payload: NetlinkPayload::from(RtnlMessage::GetLink(LinkMessage::default())),
@@ -429,9 +531,15 @@ async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     assert!(buf.len() == packet.buffer_len());
     packet.serialize(&mut buf[..]);
 
-    netif_mon.socket.send(&buf[..]).await?;
-    ftrace!("Send GetLink Message");
-    netif_mon.update().await.unwrap();
+    socket.send(&buf[..]).await?;
+    finfo!("Get link information...");
+    loop {
+        let (buf, size) = NetIfMon::recv_netlink_msg(&mut socket).await?;
+        let finish = netif_mon.update(buf, size, Some(&mut s)).await?;
+        if finish {
+            break;
+        }
+    }
 
     let mut packet = NetlinkMessage {
         header: NetlinkHeader::default(),
@@ -445,12 +553,29 @@ async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     assert!(buf.len() == packet.buffer_len());
     packet.serialize(&mut buf[..]);
 
-    netif_mon.socket.send(&buf[..]).await?;
-    ftrace!("Send GetAddress Message");
-    netif_mon.update().await.unwrap();
-
+    socket.send(&buf[..]).await?;
+    finfo!("Get address information...");
     loop {
-        ftrace!("Do update");
-        netif_mon.update().await.unwrap();
+        let (buf, size) = NetIfMon::recv_netlink_msg(&mut socket).await?;
+        let finish = netif_mon.update(buf, size, Some(&mut s)).await?;
+        if finish {
+            break;
+        }
+    }
+
+    let mut mon_socket = Socket::new(NETLINK_ROUTE).unwrap();
+    let addr = SocketAddr::new(0, NetIfMon::RTMGRP_LINK | NetIfMon::RTMGRP_IPV4_IFADDR);
+    mon_socket.bind(&addr).unwrap();
+    mon_socket.connect(&SocketAddr::new(0, 0))?;
+
+    finfo!("Start monitoring...");
+    cfg_if::cfg_if! {
+            if #[cfg(feature = "netinfo-ipcon")] {
+                let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)).unwrap();
+                ih.register_group(NETINFO_IPCON_GROUP).await?;
+                netif_mon.monitor(&mut mon_socket, ih, s, r).await
+            } else {
+                netif_mon.monitor(&mut mon_socket, s, r).await
+            }
     }
 }

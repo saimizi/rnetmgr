@@ -183,6 +183,20 @@ impl NetIf {
         self.if_index
     }
 
+    #[allow(unused)]
+    pub fn mac(&self) -> &MacAddr {
+        &self.mac
+    }
+
+    #[allow(unused)]
+    pub fn primary_ipv4addr(&self) -> Option<Ipv4Entry> {
+        if !self.ipv4.is_empty() {
+            Some(self.ipv4[0])
+        } else {
+            None
+        }
+    }
+
     pub fn state_flag_str(flags: u32) -> Vec<String> {
         let mut state = Vec::<String>::new();
         if flags & rtnl::constants::IFF_BROADCAST != 0 {
@@ -217,6 +231,11 @@ impl NetIf {
 
     pub fn del_ipv4_addr(&mut self, ipaddr: &Ipv4Entry) {
         self.ipv4.retain(|addr| addr != ipaddr);
+    }
+
+    #[allow(unused)]
+    pub fn flags(&self) -> u32 {
+        self.flags
     }
 
     pub async fn set_netif_updown(&self, up: bool) -> Result<()> {
