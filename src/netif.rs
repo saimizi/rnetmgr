@@ -189,12 +189,8 @@ impl NetIf {
     }
 
     #[allow(unused)]
-    pub fn primary_ipv4addr(&self) -> Option<Ipv4Entry> {
-        if !self.ipv4.is_empty() {
-            Some(self.ipv4[0])
-        } else {
-            None
-        }
+    pub fn ipv4addr(&self) -> &Vec<Ipv4Entry> {
+        &self.ipv4
     }
 
     pub fn state_flag_str(flags: u32) -> Vec<String> {
@@ -226,16 +222,22 @@ impl NetIf {
     }
 
     pub fn add_ipv4_addr(&mut self, ipaddr: &Ipv4Entry) {
+        ftrace!("Add {} to {}", ipaddr, self.ifname);
         self.ipv4.push(*ipaddr);
     }
 
     pub fn del_ipv4_addr(&mut self, ipaddr: &Ipv4Entry) {
+        ftrace!("Del {} to {}", ipaddr, self.ifname);
         self.ipv4.retain(|addr| addr != ipaddr);
     }
 
     #[allow(unused)]
     pub fn flags(&self) -> u32 {
         self.flags
+    }
+
+    pub fn update_flags(&mut self, newflag: u32) {
+        self.flags = newflag;
     }
 
     pub async fn set_netif_updown(&self, up: bool) -> Result<()> {

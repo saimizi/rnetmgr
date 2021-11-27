@@ -23,6 +23,9 @@ use tokio::{
 };
 
 #[cfg(feature = "netinfo-ipcon")]
+use std::ffi::CStr;
+
+#[cfg(feature = "netinfo-ipcon")]
 use ipcon_sys::{
     ipcon::{IPF_RCV_IF, IPF_SND_IF},
     ipcon_async::AsyncIpcon,
@@ -130,12 +133,10 @@ impl NetIfMon {
         let mut handlers = vec![];
 
         handlers.push(task::spawn(async move {
-            mon_thread(
-                NetIfMon {
-                    netif_hash: HashMap::<String, NetIf>::new(),
-                    netiftype_hash,
-                },
-            )
+            mon_thread(NetIfMon {
+                netif_hash: HashMap::<String, NetIf>::new(),
+                netiftype_hash,
+            })
             .await
         }));
 
@@ -167,20 +168,35 @@ impl NetIfMon {
     }
 
     #[cfg(feature = "netinfo-ipcon")]
-    async fn recv_netinfo_ipcon_msg(ih: &AsyncIpcon) -> Result<(String, NetInfoReqMessage)> {
-        let ipcon_msg = ih.receive_msg().await?;
-        if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
-            let s = std::str::from_utf8(&body.buf)
-                .map_err(|e| Error::new(ErrorKind::InvalidData, "Invalid data"))?;
-            if let Ok(req) = serde_json::from_str::<NetInfoReqMessage>(s) {
-                return Ok((body.peer.clone(), req));
+    async fn recv_netinfo_ipcon_msg(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
+        match ih.receive_msg().await {
+            Ok(ipcon_msg) => {
+                if let IpconMsg::IpconMsgUser(body) = &ipcon_msg {
+                    match unsafe { CStr::from_ptr(body.buf.as_ptr()).to_str() } {
+                        Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
+                            Ok(req) => (body.peer.clone(), Ok(req)),
+                            Err(e) => (
+                                body.peer.clone(),
+                                Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                            ),
+                        },
+                        Err(e) => (
+                            body.peer.clone(),
+                            Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                        ),
+                    }
+                } else {
+                    (
+                        String::new(),
+                        Err(Error::new(
+                            ErrorKind::InvalidData,
+                            "Invalid NetInfoReqMessage",
+                        )),
+                    )
+                }
             }
+            Err(e) => (String::new(), Err(e)),
         }
-
-        return Err(Error::new(
-            ErrorKind::InvalidData,
-            "Invalid NetInfoReqMessage",
-        ));
     }
 
     async fn update(
@@ -271,8 +287,14 @@ impl NetIfMon {
                             }
                         }
 
-                        let netif = NetIf::new(&ifname, if_index, mac, flags);
-                        self.netif_hash.insert(netif.ifname(), netif);
+                        if let Some(netif) = self.netif_hash.get_mut(&ifname) {
+                            assert_eq!(mac, *netif.mac());
+                            assert_eq!(if_index, netif.if_index());
+                            netif.update_flags(flags);
+                        } else {
+                            let netif = NetIf::new(&ifname, if_index, mac, flags);
+                            self.netif_hash.insert(netif.ifname(), netif);
+                        }
 
                         if let Some(NetIfType::EthernetStaticIpv4(addr)) =
                             self.netiftype_hash.get(&ifname)
@@ -468,44 +490,75 @@ impl NetIfMon {
         loop {
             tokio::select! {
                 Ok((buf, size)) =  NetIfMon::recv_netlink_msg(socket) => {
+                    fdebug!("NETLINK rcv ");
                     if let Err(e) = self.update(buf, size, Some(&mut s)).await {
                         ferror!("{}", e);
                     }
                 }
                 Some(m)= r.recv() => {
+                    fdebug!("MPSC rcv ");
                     if let Err(e) = NetIfMon::send_netinfo_ipcon_msg(&ih, None, m).await {
                         ferror!("{}", e);
                     }
                 }
-                Ok((peer, m)) = NetIfMon::recv_netinfo_ipcon_msg(&ih) => {
-                    match m {
-                        NetInfoReqMessage::ReqLink(s) => {
-                            let mut m = NetInfoMessage::NoInfo;
-                            if let Some(nif) = self.netif_hash.get(&s) {
-                                m = NetInfoMessage::NewLink(NetInfoNewLink{
-                                    ifname:nif.ifname(),
-                                    if_index: nif.if_index(),
-                                    mac: nif.mac().clone(),
-                                    flags: nif.flags() });
-                            }
+                (peer, ret) = NetIfMon::recv_netinfo_ipcon_msg(&ih) => {
+                    match ret {
+                        Ok(m) => {
+                            fdebug!("ReqMessage from {}", peer);
 
-                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
-                        }
-                        NetInfoReqMessage::ReqAddress(s) => {
-                            let mut m = NetInfoMessage::NoInfo;
-                            if let Some(nif) = self.netif_hash.get(&s) {
-                                if let Some(ipv4addr) = nif.primary_ipv4addr() {
-                                    m = NetInfoMessage::NewAddress(NetInfoNewAddress{
-                                        ifname:nif.ifname(),
-                                        if_index: nif.if_index(),
-                                        ipv4addr});
+                            match m {
+                                NetInfoReqMessage::ReqLink(s) => {
+                                    let mut m = NetInfoMessage::NoInfo;
+
+                                    if let Some(nif) = self.netif_hash.get(&s) {
+                                        m = NetInfoMessage::NewLink(NetInfoNewLink{
+                                            ifname:nif.ifname(),
+                                            if_index: nif.if_index(),
+                                            mac: nif.mac().clone(),
+                                            flags: nif.flags(),
+                                        });
+                                    }
+
+                                    NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                                },
+
+                                NetInfoReqMessage::ReqAddress(s) => {
+                                    fdebug!("ReqAddress msg form {} for {}", peer, s);
+                                    let mut m = NetInfoMessage::NoInfo;
+                                    if let Some(nif) = self.netif_hash.get(&s) {
+                                        fdebug!("{}", nif);
+                                        let iparray = nif.ipv4addr();
+                                        if !iparray.is_empty() {
+                                            for ip in iparray.iter() {
+                                                m = NetInfoMessage::NewAddress(NetInfoNewAddress{
+                                                    ifname:nif.ifname(),
+                                                    if_index: nif.if_index(),
+                                                    ipv4addr: *ip,
+                                                });
+                                                fdebug!("Reply {} in {} to {}", m, s, peer);
+                                                NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer.clone()), m).await;
+                                            }
+                                        } else {
+                                            fdebug!("No IP found in {} ", s);
+                                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                                        }
+                                    } else {
+                                            fdebug!("No {} found", s);
+                                        NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                                    }
                                 }
                             }
-                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
+                        },
+                        Err(e) => {
+                            if !peer.is_empty() {
+                                ferror!("Bad ReqMessage from {}: {}", peer, e);
+                                NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), NetInfoMessage::NoInfo).await;
+                            } else {
+                                ferror!("Unexpectd ReqMessage : {}", e);
+                            }
                         }
                     }
                 }
-
             }
         }
     }
@@ -513,7 +566,7 @@ impl NetIfMon {
 
 async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
-    let addr = SocketAddr::new(0,0);
+    let addr = SocketAddr::new(0, 0);
     socket.bind(&addr).unwrap();
     socket.connect(&SocketAddr::new(0, 0))?;
 
@@ -570,12 +623,12 @@ async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
 
     finfo!("Start monitoring...");
     cfg_if::cfg_if! {
-            if #[cfg(feature = "netinfo-ipcon")] {
-                let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)).unwrap();
-                ih.register_group(NETINFO_IPCON_GROUP).await?;
-                netif_mon.monitor(&mut mon_socket, ih, s, r).await
-            } else {
-                netif_mon.monitor(&mut mon_socket, s, r).await
-            }
+        if #[cfg(feature = "netinfo-ipcon")] {
+            let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)) .unwrap();
+            ih.register_group(NETINFO_IPCON_GROUP) .await?;
+            netif_mon.monitor(&mut mon_socket, ih, s, r).await
+        } else {
+            netif_mon.monitor(&mut mon_socket, s, r).await
+        }
     }
 }

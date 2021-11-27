@@ -1,7 +1,7 @@
 mod logger;
 mod netif;
-mod netinfo;
 mod netif_mon;
+mod netinfo;
 
 use clap::{App, Arg};
 use log::LevelFilter;
