@@ -524,35 +524,41 @@ impl NetIfMon {
 
                                 NetInfoReqMessage::ReqAddress(s) => {
                                     fdebug!("ReqAddress msg form {} for {}", peer, s);
-                                    let mut m = NetInfoMessage::NoInfo;
                                     if let Some(nif) = self.netif_hash.get(&s) {
                                         fdebug!("{}", nif);
                                         let iparray = nif.ipv4addr();
                                         if !iparray.is_empty() {
                                             for ip in iparray.iter() {
-                                                m = NetInfoMessage::NewAddress(NetInfoNewAddress{
-                                                    ifname:nif.ifname(),
-                                                    if_index: nif.if_index(),
-                                                    ipv4addr: *ip,
+                                                let m = NetInfoMessage::NewAddress(
+                                                    NetInfoNewAddress{
+                                                        ifname:nif.ifname(),
+                                                        if_index: nif.if_index(),
+                                                        ipv4addr: *ip,
                                                 });
                                                 fdebug!("Reply {} in {} to {}", m, s, peer);
-                                                NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer.clone()), m).await;
+                                                NetIfMon::send_netinfo_ipcon_msg(&ih,
+                                                    Some(peer.clone()),
+                                                    m).await;
                                             }
                                         } else {
                                             fdebug!("No IP found in {} ", s);
-                                            NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
                                         }
                                     } else {
                                             fdebug!("No {} found", s);
-                                        NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
                                     }
+                                    /* Send NoInfo to show the end of the addres info */
+                                    NetIfMon::send_netinfo_ipcon_msg(&ih,
+                                        Some(peer),
+                                        NetInfoMessage::NoInfo).await;
                                 }
                             }
                         },
                         Err(e) => {
                             if !peer.is_empty() {
                                 ferror!("Bad ReqMessage from {}: {}", peer, e);
-                                NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), NetInfoMessage::NoInfo).await;
+                                NetIfMon::send_netinfo_ipcon_msg(&ih,
+                                    Some(peer),
+                                    NetInfoMessage::NoInfo).await;
                             } else {
                                 ferror!("Unexpectd ReqMessage : {}", e);
                             }
