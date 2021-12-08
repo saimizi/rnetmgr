@@ -231,19 +231,17 @@ impl NetIfMon {
                     }
 
                     if !ifname.is_empty() {
-                        {
-                            let msg = NetInfoMessage::DelLink(NetInfoDelLink {
-                                ifname: ifname.clone(),
-                                if_index: lm.header.index,
-                                flags: lm.header.flags,
-                            });
+                        let msg = NetInfoMessage::DelLink(NetInfoDelLink {
+                            ifname: ifname.clone(),
+                            if_index: lm.header.index,
+                            flags: lm.header.flags,
+                        });
 
-                            fdebug!("{}", msg);
+                        fdebug!("{}", msg);
 
-                            if let Some(s) = &mut sender {
-                                if let Err(e) = s.send(msg).await {
-                                    ferror!("MPSC send error: {}", e);
-                                }
+                        if let Some(s) = &mut sender {
+                            if let Err(e) = s.send(msg).await {
+                                ferror!("MPSC send error: {}", e);
                             }
                         }
 
@@ -270,36 +268,34 @@ impl NetIfMon {
                     }
 
                     if !ifname.is_empty() {
-                        {
-                            let msg = NetInfoMessage::NewLink(NetInfoNewLink {
-                                ifname: ifname.clone(),
-                                if_index: lm.header.index,
-                                mac: mac.clone(),
-                                flags: lm.header.flags,
-                            });
+                        let msg = NetInfoMessage::NewLink(NetInfoNewLink {
+                            ifname: ifname.clone(),
+                            if_index: lm.header.index,
+                            mac: mac.clone(),
+                            flags: lm.header.flags,
+                        });
 
-                            fdebug!("{}", msg);
+                        fdebug!("{}", msg);
 
-                            if let Some(s) = &mut sender {
-                                if let Err(e) = s.send(msg).await {
-                                    ferror!("MPSC send error: {}", e);
-                                }
+                        if let Some(s) = &mut sender {
+                            if let Err(e) = s.send(msg).await {
+                                ferror!("MPSC send error: {}", e);
                             }
                         }
 
-                        if let Some(netif) = self.netif_hash.get_mut(&ifname) {
-                            assert_eq!(mac, *netif.mac());
-                            assert_eq!(if_index, netif.if_index());
-                            netif.update_flags(flags);
-                        } else {
-                            let netif = NetIf::new(&ifname, if_index, mac, flags);
-                            self.netif_hash.insert(netif.ifname(), netif);
-                        }
+                        let netif = self
+                            .netif_hash
+                            .entry(ifname.clone())
+                            .and_modify(|n| {
+                                assert_eq!(mac, *n.mac());
+                                assert_eq!(if_index, n.if_index());
+                                n.update_flags(flags);
+                            })
+                            .or_insert_with(|| NetIf::new(&ifname, if_index, mac, flags));
 
                         if let Some(NetIfType::EthernetStaticIpv4(addr)) =
                             self.netiftype_hash.get(&ifname)
                         {
-                            let netif = self.netif_hash.get_mut(&ifname).unwrap();
                             /*
                              * set_ipv4_addr() will return Ok(()) directly if the ip
                              * address has been set
@@ -339,14 +335,18 @@ impl NetIfMon {
 
                     if !ifname.is_empty() {
                         if let Some(addr) = ipaddr {
-                            let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
-                                Error::new(
+                            let n = self
+                                .netif_hash
+                                .entry(ifname.clone())
+                                .and_modify(|e| e.del_ipv4_addr(&addr))
+                                .or_default();
+
+                            if !n.is_valid() {
+                                return Err(Error::new(
                                     ErrorKind::Other,
                                     format!("DelAddress: netif {} is not found.", ifname),
-                                )
-                            })?;
-
-                            n.del_ipv4_addr(&addr);
+                                ));
+                            }
 
                             let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
                                 ifname: ifname.clone(),
@@ -415,13 +415,18 @@ impl NetIfMon {
 
                     if !ifname.is_empty() {
                         if let Some(addr) = ipaddr {
-                            let n = self.netif_hash.get_mut(&ifname).ok_or_else(|| {
-                                Error::new(
+                            let n = self
+                                .netif_hash
+                                .entry(ifname.clone())
+                                .and_modify(|n| n.add_ipv4_addr(&addr))
+                                .or_default();
+
+                            if !n.is_valid() {
+                                return Err(Error::new(
                                     ErrorKind::Other,
                                     format!("NewAddress: netif {} is not found.", ifname),
-                                )
-                            })?;
-                            n.add_ipv4_addr(&addr);
+                                ));
+                            }
 
                             let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
                                 ifname: ifname.clone(),

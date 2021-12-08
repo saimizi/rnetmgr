@@ -86,6 +86,18 @@ pub struct NetIf {
     if_index: u32,
 }
 
+impl Default for NetIf {
+    fn default() -> Self {
+        NetIf {
+            ifname: String::new(),
+            ipv4: Vec::<Ipv4Entry>::new(),
+            mac: Default::default(),
+            flags: 0,
+            if_index: NetIf::NETIF_INVALID_IF_INDEX,
+        }
+    }
+}
+
 impl PartialEq for NetIf {
     fn eq(&self, other: &Self) -> bool {
         if self.ifname != other.ifname {
@@ -165,7 +177,7 @@ impl NetIf {
             return false;
         }
 
-        if self.mac == MacAddr::default() {
+        if self.mac == Default::default() {
             return false;
         }
 
@@ -175,6 +187,7 @@ impl NetIf {
         true
     }
 
+    #[allow(unused)]
     pub fn ifname(&self) -> String {
         self.ifname.clone()
     }
