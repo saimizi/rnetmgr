@@ -22,22 +22,6 @@ use tokio::{
     task,
 };
 
-#[cfg(feature = "netinfo-ipcon")]
-use std::ffi::CStr;
-
-#[cfg(feature = "netinfo-ipcon")]
-use ipcon_sys::{
-    ipcon::{IPF_RCV_IF, IPF_SND_IF},
-    ipcon_async::AsyncIpcon,
-    ipcon_msg::IpconMsg,
-};
-
-#[cfg(feature = "netinfo-ipcon")]
-use bytes::Bytes;
-
-#[cfg(feature = "netinfo-ipcon")]
-const NETINFO_IPCON_GROUP: &'static str = "netinfo";
-
 #[derive(PartialEq, Eq)]
 enum NetIfType {
     EthernetDHCP,
@@ -147,56 +131,6 @@ impl NetIfMon {
         }
 
         Ok(())
-    }
-
-    #[cfg(feature = "netinfo-ipcon")]
-    async fn send_netinfo_ipcon_msg(
-        ih: &AsyncIpcon,
-        peer: Option<String>,
-        msg: NetInfoMessage,
-    ) -> Result<()> {
-        let buf = serde_json::to_string(&msg)
-            .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialze error: {}", e)))?;
-
-        fdebug!("{}", buf);
-        if let Some(p) = peer {
-            ih.send_unicast_msg(&p, Bytes::from(buf)).await
-        } else {
-            ih.send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
-                .await
-        }
-    }
-
-    #[cfg(feature = "netinfo-ipcon")]
-    async fn recv_netinfo_ipcon_msg(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
-        match ih.receive_msg().await {
-            Ok(ipcon_msg) => {
-                if let IpconMsg::IpconMsgUser(body) = &ipcon_msg {
-                    match unsafe { CStr::from_ptr(body.buf.as_ptr()).to_str() } {
-                        Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
-                            Ok(req) => (body.peer.clone(), Ok(req)),
-                            Err(e) => (
-                                body.peer.clone(),
-                                Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
-                            ),
-                        },
-                        Err(e) => (
-                            body.peer.clone(),
-                            Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
-                        ),
-                    }
-                } else {
-                    (
-                        String::new(),
-                        Err(Error::new(
-                            ErrorKind::InvalidData,
-                            "Invalid NetInfoReqMessage",
-                        )),
-                    )
-                }
-            }
-            Err(e) => (String::new(), Err(e)),
-        }
     }
 
     async fn update(
@@ -463,7 +397,6 @@ impl NetIfMon {
         Ok((buf, size))
     }
 
-    #[cfg(not(feature = "netinfo-ipcon"))]
     async fn monitor(
         &mut self,
         socket: &mut Socket,
@@ -484,95 +417,6 @@ impl NetIfMon {
         }
     }
 
-    #[cfg(feature = "netinfo-ipcon")]
-    async fn monitor(
-        &mut self,
-        socket: &mut Socket,
-        ih: AsyncIpcon,
-        mut s: Sender<NetInfoMessage>,
-        mut r: Receiver<NetInfoMessage>,
-    ) -> Result<()> {
-        loop {
-            tokio::select! {
-                Ok((buf, size)) =  NetIfMon::recv_netlink_msg(socket) => {
-                    fdebug!("NETLINK rcv ");
-                    if let Err(e) = self.update(buf, size, Some(&mut s)).await {
-                        ferror!("{}", e);
-                    }
-                }
-                Some(m)= r.recv() => {
-                    fdebug!("MPSC rcv ");
-                    if let Err(e) = NetIfMon::send_netinfo_ipcon_msg(&ih, None, m).await {
-                        ferror!("{}", e);
-                    }
-                }
-                (peer, ret) = NetIfMon::recv_netinfo_ipcon_msg(&ih) => {
-                    match ret {
-                        Ok(m) => {
-                            fdebug!("ReqMessage from {}", peer);
-
-                            match m {
-                                NetInfoReqMessage::ReqLink(s) => {
-                                    let mut m = NetInfoMessage::NoInfo;
-
-                                    if let Some(nif) = self.netif_hash.get(&s) {
-                                        m = NetInfoMessage::NewLink(NetInfoNewLink{
-                                            ifname:nif.ifname(),
-                                            if_index: nif.if_index(),
-                                            mac: nif.mac().clone(),
-                                            flags: nif.flags(),
-                                        });
-                                    }
-
-                                    NetIfMon::send_netinfo_ipcon_msg(&ih, Some(peer), m).await;
-                                },
-
-                                NetInfoReqMessage::ReqAddress(s) => {
-                                    fdebug!("ReqAddress msg form {} for {}", peer, s);
-                                    if let Some(nif) = self.netif_hash.get(&s) {
-                                        fdebug!("{}", nif);
-                                        let iparray = nif.ipv4addr();
-                                        if !iparray.is_empty() {
-                                            for ip in iparray.iter() {
-                                                let m = NetInfoMessage::NewAddress(
-                                                    NetInfoNewAddress{
-                                                        ifname:nif.ifname(),
-                                                        if_index: nif.if_index(),
-                                                        ipv4addr: *ip,
-                                                });
-                                                fdebug!("Reply {} in {} to {}", m, s, peer);
-                                                NetIfMon::send_netinfo_ipcon_msg(&ih,
-                                                    Some(peer.clone()),
-                                                    m).await;
-                                            }
-                                        } else {
-                                            fdebug!("No IP found in {} ", s);
-                                        }
-                                    } else {
-                                            fdebug!("No {} found", s);
-                                    }
-                                    /* Send NoInfo to show the end of the addres info */
-                                    NetIfMon::send_netinfo_ipcon_msg(&ih,
-                                        Some(peer),
-                                        NetInfoMessage::NoInfo).await;
-                                }
-                            }
-                        },
-                        Err(e) => {
-                            if !peer.is_empty() {
-                                ferror!("Bad ReqMessage from {}: {}", peer, e);
-                                NetIfMon::send_netinfo_ipcon_msg(&ih,
-                                    Some(peer),
-                                    NetInfoMessage::NoInfo).await;
-                            } else {
-                                ferror!("Unexpectd ReqMessage : {}", e);
-                            }
-                        }
-                    }
-                }
-            }
-        }
-    }
 }
 
 async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
@@ -633,13 +477,5 @@ async fn mon_thread(mut netif_mon: NetIfMon) -> Result<()> {
     mon_socket.connect(&SocketAddr::new(0, 0))?;
 
     finfo!("Start monitoring...");
-    cfg_if::cfg_if! {
-        if #[cfg(feature = "netinfo-ipcon")] {
-            let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF)) .unwrap();
-            ih.register_group(NETINFO_IPCON_GROUP) .await?;
-            netif_mon.monitor(&mut mon_socket, ih, s, r).await
-        } else {
-            netif_mon.monitor(&mut mon_socket, s, r).await
-        }
-    }
+    netif_mon.monitor(&mut mon_socket, s, r).await
 }
