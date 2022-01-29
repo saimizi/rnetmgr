@@ -78,7 +78,6 @@ impl NetIfType {
 pub struct NetIfMon {
     netif_hash: HashMap<String, NetIf>,
     netiftype_hash: HashMap<String, NetIfType>,
-    handle: rtnetlink::Handle,
 }
 
 impl Display for NetIfMon {
@@ -106,21 +105,20 @@ impl NetIfMon {
         }
 
         let (mut conn, handle, mut messages) = rtnetlink::new_connection()?;
-        let groups = RTNLGRP_LINK | RTNLGRP_IPV4_IFADDR | RTNLGRP_IPV4_ROUTE;
+        let groups = 1 << (RTNLGRP_LINK - 1) | 1 << (RTNLGRP_IPV4_IFADDR - 1);
+        fdebug!("group: {}", groups);
         let addr = SocketAddr::new(0, groups);
         let (mut s, mut r) = mpsc::channel(100);
         conn.socket_mut().socket_mut().bind(&addr)?;
         tokio::spawn(conn);
 
-        let handle_c = handle.clone();
         let mut netif_mon = NetIfMon {
             netif_hash: HashMap::<String, NetIf>::new(),
             netiftype_hash,
-            handle,
         };
 
         /* Dump all Link information */
-        let mut links = handle_c.link().get().execute();
+        let mut links = handle.link().get().execute();
         while let Some(lm) = links
             .try_next()
             .await
@@ -135,7 +133,7 @@ impl NetIfMon {
         }
 
         /* Dump all address information */
-        let mut addrs = handle_c.address().get().execute();
+        let mut addrs = handle.address().get().execute();
         while let Some(am) = addrs
             .try_next()
             .await
@@ -257,9 +255,9 @@ impl NetIfMon {
                          * set_ipv4_addr() will return Ok(()) directly if the ip
                          * address has been set
                          */
-                        if let Err(e) = netif.set_ipv4_addr(&self.handle, addr).await {
+                        if let Err(e) = netif.set_ipv4_addr(addr).await {
                             ferror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
-                        } else if let Err(e) = netif.set_netif_updown(&self.handle, true).await {
+                        } else if let Err(e) = netif.set_netif_updown(true).await {
                             ferror!("Failed to set {} UP: {}", ifname, e);
                         }
                     }
@@ -332,16 +330,14 @@ impl NetIfMon {
                                  * set_ipv4_addr() will return Ok(()) directly if the ip
                                  * address has been set
                                  */
-                                if let Err(e) = netif.set_ipv4_addr(&self.handle, &addr).await {
+                                if let Err(e) = netif.set_ipv4_addr(&addr).await {
                                     ferror!(
                                         "Failed to set ip address {} to {}: {}",
                                         addr,
                                         ifname,
                                         e
                                     );
-                                } else if let Err(e) =
-                                    netif.set_netif_updown(&self.handle, true).await
-                                {
+                                } else if let Err(e) = netif.set_netif_updown(true).await {
                                     ferror!("Failed to set {} UP: {}", ifname, e);
                                 }
                             }

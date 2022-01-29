@@ -238,7 +238,9 @@ impl NetIf {
         self.flags = newflag;
     }
 
-    pub async fn set_netif_updown(&self, handle: &rtnetlink::Handle, up: bool) -> Result<()> {
+    pub async fn set_netif_updown(&self, up: bool) -> Result<()> {
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(conn);
         if up {
             handle
                 .link()
@@ -258,11 +260,10 @@ impl NetIf {
         }
     }
 
-    pub async fn set_ipv4_addr(
-        &self,
-        handle: &rtnetlink::Handle,
-        ipaddr: &IpNetwork,
-    ) -> Result<()> {
+    pub async fn set_ipv4_addr(&self, ipaddr: &IpNetwork) -> Result<()> {
+        let (conn, handle, _) = rtnetlink::new_connection()?;
+        tokio::spawn(conn);
+
         fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         if !self.is_valid() {
             return Err(Error::new(
@@ -271,7 +272,11 @@ impl NetIf {
             ));
         }
 
-        if self.ipv4.iter().any(|x| x == ipaddr) {
+        if self
+            .ipv4
+            .iter()
+            .any(|x| (x.ip() == ipaddr.ip()) && (x.prefix() == ipaddr.prefix()))
+        {
             return Ok(());
         }
 
