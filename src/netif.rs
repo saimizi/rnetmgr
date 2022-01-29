@@ -4,17 +4,14 @@ use netlink_packet_route::{
     NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
 };
 
-use netlink_sys::protocols::NETLINK_ROUTE;
-use netlink_sys::SocketAddr;
-use netlink_sys::TokioSocket as Socket;
-
 #[allow(unused)]
 use rtnl::address::nlas::Nla as AddrNla;
+
+use ipnetwork::IpNetwork;
 
 #[allow(unused)]
 use rtnl::link::nlas::Nla as LinkNla;
 use std::fmt::{self, Display, Formatter};
-use std::net::Ipv4Addr;
 use tokio::io::{Error, ErrorKind, Result};
 
 use serde_derive::{Deserialize, Serialize};
@@ -66,21 +63,9 @@ impl PartialEq for MacAddr {
     }
 }
 
-#[derive(PartialEq, Eq, Clone, Copy, Debug, Serialize, Deserialize)]
-pub struct Ipv4Entry {
-    pub ip: Ipv4Addr,
-    pub prefix_len: u8,
-}
-
-impl Display for Ipv4Entry {
-    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
-        write!(f, "{}/{}", self.ip, self.prefix_len,)
-    }
-}
-
 pub struct NetIf {
     ifname: String,
-    ipv4: Vec<Ipv4Entry>,
+    ipv4: Vec<IpNetwork>,
     mac: MacAddr,
     flags: u32,
     if_index: u32,
@@ -90,7 +75,7 @@ impl Default for NetIf {
     fn default() -> Self {
         NetIf {
             ifname: String::new(),
-            ipv4: Vec::<Ipv4Entry>::new(),
+            ipv4: Vec::<IpNetwork>::new(),
             mac: Default::default(),
             flags: 0,
             if_index: NetIf::NETIF_INVALID_IF_INDEX,
@@ -165,7 +150,7 @@ impl NetIf {
     pub fn new(ifname: &str, if_index: u32, mac: MacAddr, flags: u32) -> Self {
         NetIf {
             ifname: ifname.to_string(),
-            ipv4: Vec::<Ipv4Entry>::new(),
+            ipv4: Vec::<IpNetwork>::new(),
             mac,
             flags,
             if_index,
@@ -202,7 +187,7 @@ impl NetIf {
     }
 
     #[allow(unused)]
-    pub fn ipv4addr(&self) -> &Vec<Ipv4Entry> {
+    pub fn ipv4addr(&self) -> &Vec<IpNetwork> {
         &self.ipv4
     }
 
@@ -234,12 +219,12 @@ impl NetIf {
         state
     }
 
-    pub fn add_ipv4_addr(&mut self, ipaddr: &Ipv4Entry) {
+    pub fn add_ipv4_addr(&mut self, ipaddr: &IpNetwork) {
         ftrace!("Add {} to {}", ipaddr, self.ifname);
         self.ipv4.push(*ipaddr);
     }
 
-    pub fn del_ipv4_addr(&mut self, ipaddr: &Ipv4Entry) {
+    pub fn del_ipv4_addr(&mut self, ipaddr: &IpNetwork) {
         ftrace!("Del {} to {}", ipaddr, self.ifname);
         self.ipv4.retain(|addr| addr != ipaddr);
     }
@@ -253,99 +238,31 @@ impl NetIf {
         self.flags = newflag;
     }
 
-    pub async fn set_netif_updown(&self, up: bool) -> Result<()> {
-        if !self.is_valid() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid netif {}", self.ifname),
-            ));
-        }
-
-        let mut flags = self.flags;
+    pub async fn set_netif_updown(&self, handle: &rtnetlink::Handle, up: bool) -> Result<()> {
         if up {
-            fdebug!("Set netif {} UP", self.ifname);
-            flags |= rtnl::constants::IFF_UP;
+            handle
+                .link()
+                .set(self.if_index)
+                .up()
+                .execute()
+                .await
+                .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
         } else {
-            fdebug!("Set netif {} DOWN", self.ifname);
-            flags &= !rtnl::constants::IFF_UP;
+            handle
+                .link()
+                .set(self.if_index)
+                .down()
+                .execute()
+                .await
+                .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
         }
-
-        if flags == self.flags {
-            return Ok(());
-        }
-
-        let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
-        let addr = SocketAddr::new(0, 0);
-        socket.bind(&addr)?;
-        socket.connect(&SocketAddr::new(0, 0))?;
-
-        let header = LinkHeader {
-            interface_family: rtnl::constants::AF_INET as u8,
-            index: self.if_index,
-            flags,
-            ..Default::default()
-        };
-
-        let mut packet = NetlinkMessage {
-            header: NetlinkHeader::default(),
-            payload: NetlinkPayload::from(RtnlMessage::SetLink(LinkMessage {
-                header,
-                nlas: vec![],
-            })),
-        };
-
-        packet.header.flags = NLM_F_CREATE | NLM_F_EXCL | NLM_F_REQUEST | NLM_F_ACK;
-        packet.header.sequence_number = 1;
-        packet.finalize();
-
-        let mut buf: Vec<u8> = vec![0; packet.header.length as usize];
-        assert!(buf.len() == packet.buffer_len());
-        packet.serialize(&mut buf[..]);
-
-        socket.send(&buf[..]).await?;
-
-        let mut receive_buffer = vec![0; 4096];
-        let mut offset = 0;
-
-        'main: loop {
-            let size = socket.recv(&mut receive_buffer[..]).await?;
-
-            loop {
-                let bytes = &receive_buffer[offset..];
-                let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
-
-                match rx_packet.payload {
-                    NetlinkPayload::Done => {
-                        ftrace!("LINK Msge (UP/DOWN): Receive Packet process Done");
-                        break 'main;
-                    }
-
-                    NetlinkPayload::Error(e) => {
-                        return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
-                    }
-
-                    NetlinkPayload::Ack(e) => {
-                        finfo!("Link (UP/DOWN) ACK: {}", e);
-                        break 'main;
-                    }
-
-                    _ => {
-                        fdebug! {"Unknown message"}
-                    }
-                }
-
-                offset += rx_packet.header.length as usize;
-                if offset == size || rx_packet.header.length == 0 {
-                    offset = 0;
-                    break;
-                }
-            }
-        }
-        Ok(())
     }
 
-    pub async fn set_ipv4_addr(&self, ipaddr: &Ipv4Entry) -> Result<()> {
+    pub async fn set_ipv4_addr(
+        &self,
+        handle: &rtnetlink::Handle,
+        ipaddr: &IpNetwork,
+    ) -> Result<()> {
         fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         if !self.is_valid() {
             return Err(Error::new(
@@ -358,90 +275,11 @@ impl NetIf {
             return Ok(());
         }
 
-        let mut socket = Socket::new(NETLINK_ROUTE).unwrap();
-        let addr = SocketAddr::new(0, 0);
-        socket.bind(&addr)?;
-        socket.connect(&SocketAddr::new(0, 0))?;
-
-        let header = AddressHeader {
-            family: 2,
-            prefix_len: ipaddr.prefix_len,
-            index: self.if_index,
-            ..Default::default()
-        };
-
-        let iparray: Vec<u8> = ipaddr
-            .ip
-            .to_string()
-            .split('.')
-            .map(|a| a.parse::<u8>().unwrap())
-            .collect();
-
-        let mut packet = NetlinkMessage {
-            header: NetlinkHeader::default(),
-            payload: NetlinkPayload::from(RtnlMessage::NewAddress(AddressMessage {
-                header,
-                nlas: vec![AddrNla::Local(iparray)],
-            })),
-        };
-
-        packet.header.flags = NLM_F_CREATE | NLM_F_EXCL | NLM_F_REQUEST | NLM_F_ACK;
-        packet.header.sequence_number = 1;
-        packet.finalize();
-
-        let mut buf: Vec<u8> = vec![0; packet.header.length as usize];
-        assert!(buf.len() == packet.buffer_len());
-        packet.serialize(&mut buf[..]);
-
-        socket.send(&buf[..]).await?;
-
-        let mut receive_buffer = vec![0; 4096];
-        let mut offset = 0;
-
-        'main: loop {
-            let size = socket.recv(&mut receive_buffer[..]).await?;
-
-            loop {
-                let bytes = &receive_buffer[offset..];
-                let rx_packet: NetlinkMessage<RtnlMessage> = NetlinkMessage::deserialize(bytes)
-                    .map_err(|e| Error::new(ErrorKind::InvalidData, format!("{}", e)))?;
-
-                match rx_packet.payload {
-                    NetlinkPayload::Done => {
-                        ftrace!("NewAddress Receive Packet process Done");
-                        break 'main;
-                    }
-
-                    NetlinkPayload::Error(e) => {
-                        if let Some(17) = e.to_io().raw_os_error() {
-                            fwarn!(
-                                "Address {} has already been set for {}.",
-                                ipaddr,
-                                self.ifname
-                            );
-                            break 'main;
-                        }
-                        return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
-                    }
-
-                    NetlinkPayload::Ack(e) => {
-                        finfo!("NewAddress ACK: {}", e);
-                        break 'main;
-                    }
-
-                    _ => {
-                        fdebug! {"Unknown message"}
-                    }
-                }
-
-                offset += rx_packet.header.length as usize;
-                if offset == size || rx_packet.header.length == 0 {
-                    offset = 0;
-                    break;
-                }
-            }
-        }
-
-        Ok(())
+        handle
+            .address()
+            .add(self.if_index, ipaddr.ip(), ipaddr.prefix())
+            .execute()
+            .await
+            .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
     }
 }

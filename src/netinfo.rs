@@ -1,4 +1,5 @@
-use crate::netif::{Ipv4Entry, MacAddr};
+use crate::netif::MacAddr;
+use ipnetwork::IpNetwork;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
@@ -44,7 +45,7 @@ impl Display for NetInfoDelLink {
 pub struct NetInfoNewAddress {
     pub ifname: String,
     pub if_index: u32,
-    pub ipv4addr: Ipv4Entry,
+    pub ipv4addr: IpNetwork,
 }
 
 impl Display for NetInfoNewAddress {
@@ -61,7 +62,7 @@ impl Display for NetInfoNewAddress {
 pub struct NetInfoDelAddress {
     pub ifname: String,
     pub if_index: u32,
-    pub ipv4addr: Ipv4Entry,
+    pub ipv4addr: IpNetwork,
 }
 
 impl Display for NetInfoDelAddress {

@@ -8,8 +8,11 @@ repository = "git@gitlab.com:joukan/netmgr.git"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-netlink-packet-route = "0.8.0"
-netlink-sys={version =  "0.7.0", features = ["tokio_socket"]}
+futures = "0.3.19"
+netlink-packet-core = "0.4.1"
+netlink-packet-route = "0.10.0"
+rtnetlink = "0.9.0"
+ipnetwork = "0.18.0"
 serde = "1.0"
 serde_derive = "1.0"
 serde_json = "1.0"
