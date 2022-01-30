@@ -248,17 +248,19 @@ impl NetIfMon {
                         })
                         .or_insert_with(|| NetIf::new(&ifname, if_index, mac, flags));
 
-                    if let Some(NetIfType::EthernetStaticIpv4(addr)) =
-                        self.netiftype_hash.get(&ifname)
-                    {
-                        /*
-                         * set_ipv4_addr() will return Ok(()) directly if the ip
-                         * address has been set
-                         */
-                        if let Err(e) = netif.set_ipv4_addr(addr).await {
-                            ferror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
-                        } else if let Err(e) = netif.set_netif_updown(true).await {
-                            ferror!("Failed to set {} UP: {}", ifname, e);
+                    if let Some(ntype) = self.netiftype_hash.get(&ifname) {
+                        if let NetIfType::EthernetStaticIpv4(addr) = ntype {
+                            if let Err(e) = netif.set_ipv4_addr(addr).await {
+                                ferror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
+                            } else if let Err(e) = netif.set_netif_updown(true).await {
+                                ferror!("Failed to set {} UP: {}", ifname, e);
+                            }
+                        }
+
+                        if let NetIfType::EthernetDHCP = ntype {
+                            if let Err(e) = netif.enable_dhcp_client().await {
+                                ferror!("Failed to enable dhcp client for {}: {}", ifname, e);
+                            }
                         }
                     }
                 }

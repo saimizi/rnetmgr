@@ -9,6 +9,8 @@ use rtnl::address::nlas::Nla as AddrNla;
 
 use ipnetwork::IpNetwork;
 
+use tokio::process::{Child, Command};
+
 #[allow(unused)]
 use rtnl::link::nlas::Nla as LinkNla;
 use std::fmt::{self, Display, Formatter};
@@ -69,6 +71,7 @@ pub struct NetIf {
     mac: MacAddr,
     flags: u32,
     if_index: u32,
+    dhcp_client: Option<Child>,
 }
 
 impl Default for NetIf {
@@ -79,6 +82,7 @@ impl Default for NetIf {
             mac: Default::default(),
             flags: 0,
             if_index: NetIf::NETIF_INVALID_IF_INDEX,
+            dhcp_client: None,
         }
     }
 }
@@ -154,6 +158,7 @@ impl NetIf {
             mac,
             flags,
             if_index,
+            dhcp_client: None,
         }
     }
 
@@ -286,5 +291,24 @@ impl NetIf {
             .execute()
             .await
             .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
+    }
+
+    pub async fn enable_dhcp_client(&mut self) -> Result<()> {
+        if let Some(dc) = &mut self.dhcp_client {
+            if let Ok(None) = dc.try_wait() {
+                finfo!("dhcp clinet is running for {}\n", self.ifname);
+                return Ok(());
+            }
+        }
+
+        let cmd = "/usr/sbin/dhclient";
+        let mut args = vec![];
+        args.push(self.ifname());
+
+        finfo!("Start dhcp for {}", self.ifname);
+        let c = Command::new(cmd).args(args).spawn()?;
+        self.dhcp_client = Some(c);
+
+        Ok(())
     }
 }
