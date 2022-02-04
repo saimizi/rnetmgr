@@ -301,11 +301,11 @@ impl NetIf {
             }
         }
 
-        let cmd = "/usr/sbin/dhclient";
-        let mut args = vec![];
-        args.push(self.ifname());
+        let cmd = "/sbin/dhcpcd";
+        let args = vec![String::from("-B"), self.ifname()];
 
         finfo!("Start dhcp for {}", self.ifname);
+        finfo!("CMD: {} {}", cmd, args.join(" "));
         let c = Command::new(cmd).args(args).spawn()?;
         self.dhcp_client = Some(c);
 
