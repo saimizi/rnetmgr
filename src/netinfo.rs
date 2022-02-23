@@ -1,10 +1,50 @@
-use crate::netif::MacAddr;
 use ipnetwork::IpNetwork;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-#[allow(unused)]
-use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
+#[derive(Serialize, Deserialize, Debug)]
+pub struct MacAddr {
+    pub addr: Vec<u8>,
+}
+
+impl Default for MacAddr {
+    fn default() -> Self {
+        MacAddr {
+            addr: vec![0, 0, 0, 0, 0, 0, 0],
+        }
+    }
+}
+
+impl Clone for MacAddr {
+    fn clone(&self) -> Self {
+        MacAddr {
+            addr: self.addr.clone(),
+        }
+    }
+}
+
+impl Display for MacAddr {
+    fn fmt(&self, f: &mut Formatter<'_>) -> fmt::Result {
+        if !self.addr.is_empty() {
+            let mac_str = self
+                .addr
+                .iter()
+                .map(|a| format!("{:02x}", a))
+                .collect::<Vec<String>>()
+                .join(":");
+
+            write!(f, "{}", mac_str)
+        } else {
+            write!(f, "--:--:--:--:--:--")
+        }
+    }
+}
+
+impl PartialEq for MacAddr {
+    fn eq(&self, other: &Self) -> bool {
+        self.to_string() == other.to_string()
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetInfoNewLink {

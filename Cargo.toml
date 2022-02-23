@@ -7,6 +7,14 @@ repository = "git@gitlab.com:joukan/netmgr.git"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
+[lib]
+name = "rnetmgr_lib"
+path = "src/lib.rs"
+
+[[bin]]
+name = "rnetmgr"
+path = "src/main.rs"
+
 [dependencies]
 futures = "0.3.19"
 netlink-packet-core = "0.4.1"

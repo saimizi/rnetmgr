@@ -1,8 +1,8 @@
-use crate::netif::{MacAddr, NetIf};
+use crate::netif::NetIf;
 #[allow(unused)]
-use crate::netinfo::{
+use rnetmgr_lib::netinfo::{
     NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
-    NetInfoReqMessage,
+    NetInfoReqMessage, MacAddr
 };
 #[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
@@ -27,10 +27,9 @@ use tokio::{
 };
 
 use bytes::Bytes;
-use ipcon_sys::ipcon::{self, IPF_RCV_IF, IPF_SND_IF};
+use ipcon_sys::ipcon::{IPF_RCV_IF, IPF_SND_IF};
 use ipcon_sys::ipcon_async::AsyncIpcon;
-use ipcon_sys::ipcon_msg::{IpconMsg, IpconMsgType};
-use serde::{Deserialize, Serialize};
+use ipcon_sys::ipcon_msg::{IpconMsg};
 use std::ffi::CStr;
 
 const NETINFO_IPCON_GROUP: &'static str = "netinfo";
@@ -102,7 +101,7 @@ async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
     match ih.receive_msg().await {
         Ok(ipcon_msg) => {
             if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
-                match unsafe { CStr::from_ptr(body.buf.as_ptr()).to_str() } {
+                match unsafe { CStr::from_ptr(body.buf.as_ptr() as *const i8).to_str() } {
                     Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
                         Ok(req) => (body.peer.clone(), Ok(req)),
                         Err(e) => (
@@ -243,7 +242,7 @@ impl NetIfMon {
                                             });
                                         }
 
-                                        netinfo_send(&ih, Some(peer), m).await;
+                                        let _ = netinfo_send(&ih, Some(peer), m).await;
                                 }
                                 NetInfoReqMessage::ReqAddress(s) => {
                                         fdebug!("ReqMessage from {} for {}", peer, s);
@@ -258,20 +257,20 @@ impl NetIfMon {
                                                 });
 
                                                 fdebug!("Reply {} in {} to  {}", m, s, peer);
-                                                netinfo_send(&ih, Some(peer.clone()), m).await;
+                                                let _ = netinfo_send(&ih, Some(peer.clone()), m).await;
                                             }
                                         } else {
                                             fdebug!("No IP found for {}", s);
                                         }
 
-                                        netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
+                                        let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
                                 }
                             }
                         }
                         Err(e) => {
                             if !peer.is_empty() {
                                 ferror!("Bad NetInfoReqMessage from {} : {}", peer, e);
-                                netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
+                                let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
                             } else {
                                 ferror!("Unexpectd NetInfoReqMessage : {}", e);
                             }
