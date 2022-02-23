@@ -82,6 +82,7 @@ pub enum NetInfoMessage {
     NewAddress(NetInfoNewAddress),
     DelAddress(NetInfoDelAddress),
     NoInfo,
+    InvalidReq,
 }
 
 impl Display for NetInfoMessage {
@@ -92,6 +93,7 @@ impl Display for NetInfoMessage {
             NetInfoMessage::NewAddress(a) => write!(f, "{}", a),
             NetInfoMessage::DelAddress(a) => write!(f, "{}", a),
             NetInfoMessage::NoInfo => write!(f, "none"),
+            NetInfoMessage::InvalidReq => write!(f, "invalid"),
         }
     }
 }

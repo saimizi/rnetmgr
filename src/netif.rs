@@ -226,7 +226,9 @@ impl NetIf {
 
     pub fn add_ipv4_addr(&mut self, ipaddr: &IpNetwork) {
         ftrace!("Add {} to {}", ipaddr, self.ifname);
-        self.ipv4.push(*ipaddr);
+        if ! self.ipv4.iter().any(|a| a == ipaddr) {
+            self.ipv4.push(*ipaddr);
+        }
     }
 
     pub fn del_ipv4_addr(&mut self, ipaddr: &IpNetwork) {

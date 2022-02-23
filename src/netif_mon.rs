@@ -26,6 +26,15 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 
+use bytes::Bytes;
+use ipcon_sys::ipcon::{self, IPF_RCV_IF, IPF_SND_IF};
+use ipcon_sys::ipcon_async::AsyncIpcon;
+use ipcon_sys::ipcon_msg::{IpconMsg, IpconMsgType};
+use serde::{Deserialize, Serialize};
+use std::ffi::CStr;
+
+const NETINFO_IPCON_GROUP: &'static str = "netinfo";
+
 #[derive(PartialEq, Eq)]
 enum NetIfType {
     EthernetDHCP,
@@ -89,6 +98,52 @@ impl Display for NetIfMon {
     }
 }
 
+async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
+    match ih.receive_msg().await {
+        Ok(ipcon_msg) => {
+            if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
+                match unsafe { CStr::from_ptr(body.buf.as_ptr()).to_str() } {
+                    Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
+                        Ok(req) => (body.peer.clone(), Ok(req)),
+                        Err(e) => (
+                            body.peer.clone(),
+                            Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                        ),
+                    },
+                    Err(e) => (
+                        body.peer.clone(),
+                        Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                    ),
+                }
+            } else {
+                (
+                    String::new(),
+                    Err(Error::new(
+                        ErrorKind::InvalidData,
+                        "Invalid NetInfoReqMessage",
+                    )),
+                )
+            }
+        }
+        Err(e) => (String::new(), Err(e)),
+    }
+}
+
+async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage) -> Result<()> {
+    let buf = serde_json::to_string(&msg)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
+
+
+    if let Some(p) = &peer {
+        fdebug!("Send to {} : {}", p, buf);
+        ih.send_unicast_msg(p, Bytes::from(buf)).await
+    } else {
+        fdebug!("Send multicast : {}", buf);
+        ih.send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
+            .await
+    }
+}
+
 impl NetIfMon {
     pub async fn run(nifcfg: NetIfConfig) -> Result<()> {
         let mut netiftype_hash = HashMap::<String, NetIfType>::new();
@@ -149,6 +204,13 @@ impl NetIfMon {
 
         finfo!("Start monitoring...");
 
+        let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF))
+            .expect("Failed to create IPCON handler.");
+
+        ih.register_group(NETINFO_IPCON_GROUP)
+            .await
+            .expect("Failed to register rnetmgr group.");
+
         loop {
             tokio::select! {
                 Some((msg, _)) = messages.next() => {
@@ -156,8 +218,65 @@ impl NetIfMon {
                             ferror!("{}", e);
                         }
                 }
-                Some(m)= r.recv() => {
-                        finfo!("{}",m);
+
+                Some(m) = r.recv() => {
+                        finfo!("{}", m);
+                        if let Err(e) = netinfo_send(&ih, None, m).await {
+                            ferror!("{}", e);
+                        }
+                }
+
+                (peer, ret) = netinfo_rcv(&ih) => {
+                    match ret {
+                        Ok(m) => {
+                            fdebug!("ReqMessage from {}", peer);
+                            match m {
+                                NetInfoReqMessage::ReqLink(s) => {
+                                        let mut m = NetInfoMessage::NoInfo;
+
+                                        if let Some(nif) = netif_mon.netif_hash.get(&s) {
+                                            m = NetInfoMessage::NewLink(NetInfoNewLink {
+                                                    ifname : nif.ifname(),
+                                                    if_index : nif.if_index(),
+                                                    mac : nif.mac().clone(),
+                                                    flags : nif.flags(),
+                                            });
+                                        }
+
+                                        netinfo_send(&ih, Some(peer), m).await;
+                                }
+                                NetInfoReqMessage::ReqAddress(s) => {
+                                        fdebug!("ReqMessage from {} for {}", peer, s);
+                                        if let Some(nif) = netif_mon.netif_hash.get(&s) {
+                                            let iparray = nif.ipv4addr();
+                                            for ip in iparray.iter() {
+                                                let m = NetInfoMessage::NewAddress(
+                                                    NetInfoNewAddress {
+                                                        ifname : nif.ifname(),
+                                                        if_index : nif.if_index(),
+                                                        ipv4addr : *ip,
+                                                });
+
+                                                fdebug!("Reply {} in {} to  {}", m, s, peer);
+                                                netinfo_send(&ih, Some(peer.clone()), m).await;
+                                            }
+                                        } else {
+                                            fdebug!("No IP found for {}", s);
+                                        }
+
+                                        netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
+                                }
+                            }
+                        }
+                        Err(e) => {
+                            if !peer.is_empty() {
+                                ferror!("Bad NetInfoReqMessage from {} : {}", peer, e);
+                                netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
+                            } else {
+                                ferror!("Unexpectd NetInfoReqMessage : {}", e);
+                            }
+                        }
+                    }
                 }
             }
         }
