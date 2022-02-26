@@ -2,6 +2,9 @@ use ipnetwork::IpNetwork;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
+pub const NETINFO_IPCON : &str = "rnetmgr";
+pub const NETINFO_IPCON_GROUP: &str = "netinfo";
+
 #[derive(Serialize, Deserialize, Debug)]
 pub struct MacAddr {
     pub addr: Vec<u8>,

@@ -1,12 +1,12 @@
 use crate::netif::NetIf;
 #[allow(unused)]
-use rnetmgr_lib::netinfo::{
-    NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
-    NetInfoReqMessage, MacAddr
-};
-#[allow(unused)]
 use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
 use ipnetwork::{IpNetwork, Ipv4Network};
+#[allow(unused)]
+use rnetmgr_lib::netinfo::{
+    MacAddr, NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
+    NetInfoReqMessage, NETINFO_IPCON, NETINFO_IPCON_GROUP,
+};
 
 #[allow(unused)]
 use netlink_packet_route::{
@@ -29,10 +29,8 @@ use tokio::{
 use bytes::Bytes;
 use ipcon_sys::ipcon::{IPF_RCV_IF, IPF_SND_IF};
 use ipcon_sys::ipcon_async::AsyncIpcon;
-use ipcon_sys::ipcon_msg::{IpconMsg};
+use ipcon_sys::ipcon_msg::IpconMsg;
 use std::ffi::CStr;
-
-const NETINFO_IPCON_GROUP: &'static str = "netinfo";
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -103,14 +101,14 @@ async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
             if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
                 match unsafe { CStr::from_ptr(body.buf.as_ptr() as *const i8).to_str() } {
                     Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
-                        Ok(req) => (body.peer.clone(), Ok(req)),
+                        Ok(req) => (body.peer, Ok(req)),
                         Err(e) => (
-                            body.peer.clone(),
+                            body.peer,
                             Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
                         ),
                     },
                     Err(e) => (
-                        body.peer.clone(),
+                        body.peer,
                         Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
                     ),
                 }
@@ -131,7 +129,6 @@ async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
 async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage) -> Result<()> {
     let buf = serde_json::to_string(&msg)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
-
 
     if let Some(p) = &peer {
         fdebug!("Send to {} : {}", p, buf);
@@ -203,7 +200,7 @@ impl NetIfMon {
 
         finfo!("Start monitoring...");
 
-        let ih = AsyncIpcon::new(Some("rnetmgr"), Some(IPF_RCV_IF | IPF_SND_IF))
+        let ih = AsyncIpcon::new(Some(NETINFO_IPCON), Some(IPF_RCV_IF | IPF_SND_IF))
             .expect("Failed to create IPCON handler.");
 
         ih.register_group(NETINFO_IPCON_GROUP)
