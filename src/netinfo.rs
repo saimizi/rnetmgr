@@ -2,7 +2,7 @@ use ipnetwork::IpNetwork;
 use serde_derive::{Deserialize, Serialize};
 use std::fmt::{self, Display, Formatter};
 
-pub const NETINFO_IPCON : &str = "rnetmgr";
+pub const NETINFO_IPCON: &str = "rnetmgr";
 pub const NETINFO_IPCON_GROUP: &str = "netinfo";
 
 #[derive(Serialize, Deserialize, Debug)]
@@ -115,6 +115,28 @@ impl Display for NetInfoDelAddress {
             "DelAddr {} {} {}",
             self.ifname, self.if_index, self.ipv4addr
         )
+    }
+}
+
+impl NetInfoNewAddress {
+    pub fn ifname(&self) -> String {
+        self.ifname.clone()
+    }
+
+    pub fn if_index(&self) -> u32 {
+        self.if_index
+    }
+
+    pub fn ipstr(&self) -> Option<String> {
+        if let IpNetwork::V4(n) = self.ipv4addr {
+            Some(n.ip().to_string())
+        } else {
+            None
+        }
+    }
+
+    pub fn prefix(&self) -> u8 {
+        self.ipv4addr.prefix()
     }
 }
 
