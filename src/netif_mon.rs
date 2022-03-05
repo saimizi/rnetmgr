@@ -30,7 +30,7 @@ use bytes::Bytes;
 use ipcon_sys::ipcon::{IPF_RCV_IF, IPF_SND_IF};
 use ipcon_sys::ipcon_async::AsyncIpcon;
 use ipcon_sys::ipcon_msg::IpconMsg;
-use std::ffi::CStr;
+use std::ffi::{CStr, CString};
 
 #[derive(PartialEq, Eq)]
 enum NetIfType {
@@ -130,16 +130,25 @@ async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage
     let buf = serde_json::to_string(&msg)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
 
-    let cstr_buf = unsafe { CStr::from_ptr(buf.as_ptr()) };
-
     if let Some(p) = &peer {
         fdebug!("Send to {} : {}", p, buf);
-        ih.send_unicast_msg(p, Bytes::from(cstr_buf.to_bytes_with_nul()))
-            .await
     } else {
         fdebug!("Send multicast : {}", buf);
-        ih.send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
+    }
+
+    let c_buf = CString::new(buf)
+        .map_err(|e| Error::new(ErrorKind::InvalidData, format!("CString trans error {}", e)))?;
+
+    if let Some(p) = &peer {
+        ih.send_unicast_msg(p, Bytes::from(c_buf.into_bytes_with_nul()))
             .await
+    } else {
+        ih.send_multicast(
+            NETINFO_IPCON_GROUP,
+            Bytes::from(c_buf.into_bytes_with_nul()),
+            false,
+        )
+        .await
     }
 }
 
