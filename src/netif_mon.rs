@@ -130,9 +130,12 @@ async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage
     let buf = serde_json::to_string(&msg)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
 
+    let cstr_buf = unsafe { CStr::from_ptr(buf.as_ptr()) };
+
     if let Some(p) = &peer {
         fdebug!("Send to {} : {}", p, buf);
-        ih.send_unicast_msg(p, Bytes::from(buf)).await
+        ih.send_unicast_msg(p, Bytes::from(cstr_buf.to_bytes_with_nul()))
+            .await
     } else {
         fdebug!("Send multicast : {}", buf);
         ih.send_multicast(NETINFO_IPCON_GROUP, Bytes::from(buf), false)
