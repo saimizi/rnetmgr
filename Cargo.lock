@@ -132,19 +132,6 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "56899898ce76aaf4a0f24d914c97ea6ed976d42fec6ad33fcbb0a1103e07b2b0"
 
 [[package]]
-name = "env_logger"
-version = "0.8.4"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "a19187fea3ac7e84da7dacf48de0c45d63c6a76f9490dae389aead16c243fce3"
-dependencies = [
- "atty",
- "humantime",
- "log",
- "regex",
- "termcolor",
-]
-
-[[package]]
 name = "fnv"
 version = "1.0.7"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -291,12 +278,13 @@ dependencies = [
 
 [[package]]
 name = "ipcon-sys"
-version = "0.1.0"
-source = "git+ssh://git@gitlab.com/joukan/ipcon-sys.git?branch=ipcon-sys-lib#442fb8e812789dca011bef908bab1dc799ffab30"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "31a742f359e111ddd97b419fe9d6dcf62e6760b331a0dcc90a6caf5fd94455da"
 dependencies = [
  "bytes",
- "env_logger",
  "futures",
+ "jlogger",
  "libc",
  "log",
  "nix",
@@ -317,6 +305,15 @@ name = "itoa"
 version = "0.4.8"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b71991ff56294aa922b450139ee08b3bfc70982c6b2c7562771375cf73542dd4"
+
+[[package]]
+name = "jlogger"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "b9c2843ac21f4de86671ecceed9adc7c2a6c2f7d152e7febf8566cdd1d3685cc"
+dependencies = [
+ "log",
+]
 
 [[package]]
 name = "lazy_static"

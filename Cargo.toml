@@ -1,9 +1,11 @@
 [package]
 name = "rnetmgr"
 version = "0.1.0"
-authors = ["Seimizu Joukan <saimizi@gmail.com>"]
+description = "A simple network manager."
+authors = ["Seimizu Joukan <joukan.seimizu@gmail.com>"]
 edition = "2018"
-repository = "git@gitlab.com:joukan/netmgr.git"
+repository = "https://gitlab.com/joukan/netmgr.git"
+license = "MIT OR Apache-2.0"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
@@ -30,7 +32,7 @@ log = "0.4.14"
 tokio = {version = "1", features = ["full"]}
 cfg-if = "1.0.0"
 bytes = "1.1.0"
-ipcon-sys = { git = "ssh://git@gitlab.com/joukan/ipcon-sys.git", branch = "ipcon-sys-lib", features = ["async"] }
+ipcon-sys = { version="0.1.1", features = ["async"] }
 
 [features]
 default = []
