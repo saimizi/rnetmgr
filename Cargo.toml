@@ -1,6 +1,6 @@
 [package]
 name = "rnetmgr"
-version = "0.1.0"
+version = "0.1.1"
 description = "A simple network manager."
 authors = ["Seimizu Joukan <joukan.seimizu@gmail.com>"]
 edition = "2018"
