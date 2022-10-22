@@ -1,6 +1,9 @@
+//cspell:word netif ipnetwork rnetmgr netinfo IPCON rtnl Netlink Rtnl rtnetlink iftype netiftype
+//cspell:word nifcfg netifs ifname RTNLGRP IFADDR nmsg addrs nlas ntype updown ipaddr iparray
 use crate::netif::NetIf;
 #[allow(unused)]
-use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
+use crate::{jerror, jinfo, jdebug, jwarn};
+use crate::{NetIfConfig, NetIfConfigEntry};
 use ipnetwork::{IpNetwork, Ipv4Network};
 #[allow(unused)]
 use rnetmgr_lib::netinfo::{
@@ -131,9 +134,9 @@ async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
 
     if let Some(p) = &peer {
-        fdebug!("Send to {} : {}", p, buf);
+        jdebug!("Send to {} : {}", p, buf);
     } else {
-        fdebug!("Send multicast : {}", buf);
+        jdebug!("Send multicast : {}", buf);
     }
 
     let c_buf = CString::new(buf)
@@ -169,7 +172,7 @@ impl NetIfMon {
 
         let (mut conn, handle, mut messages) = rtnetlink::new_connection()?;
         let groups = 1 << (RTNLGRP_LINK - 1) | 1 << (RTNLGRP_IPV4_IFADDR - 1);
-        fdebug!("group: {}", groups);
+        jdebug!("group: {}", groups);
         let addr = SocketAddr::new(0, groups);
         let (mut s, mut r) = mpsc::channel(100);
         conn.socket_mut().socket_mut().bind(&addr)?;
@@ -210,7 +213,7 @@ impl NetIfMon {
             netif_mon.update(nmsg, Some(&mut s)).await?;
         }
 
-        finfo!("Start monitoring...");
+        jinfo!("Start monitoring...");
 
         let ih = AsyncIpcon::new(Some(NETINFO_IPCON), Some(IPF_RCV_IF | IPF_SND_IF))
             .expect("Failed to create IPCON handler.");
@@ -223,21 +226,21 @@ impl NetIfMon {
             tokio::select! {
                 Some((msg, _)) = messages.next() => {
                         if let Err(e) = netif_mon.update(msg, Some(&mut s)).await {
-                            ferror!("{}", e);
+                            jerror!("{}", e);
                         }
                 }
 
                 Some(m) = r.recv() => {
-                        finfo!("{}", m);
+                        jinfo!("{}", m);
                         if let Err(e) = netinfo_send(&ih, None, m).await {
-                            ferror!("{}", e);
+                            jerror!("{}", e);
                         }
                 }
 
                 (peer, ret) = netinfo_rcv(&ih) => {
                     match ret {
                         Ok(m) => {
-                            fdebug!("ReqMessage from {}", peer);
+                            jdebug!("ReqMessage from {}", peer);
                             match m {
                                 NetInfoReqMessage::ReqLink(s) => {
                                         let mut m = NetInfoMessage::NoInfo;
@@ -254,7 +257,7 @@ impl NetIfMon {
                                         let _ = netinfo_send(&ih, Some(peer), m).await;
                                 }
                                 NetInfoReqMessage::ReqAddress(s) => {
-                                        fdebug!("ReqMessage from {} for {}", peer, s);
+                                        jdebug!("ReqMessage from {} for {}", peer, s);
                                         if let Some(nif) = netif_mon.netif_hash.get(&s) {
                                             let iparray = nif.ipv4addr();
                                             for ip in iparray.iter() {
@@ -265,11 +268,11 @@ impl NetIfMon {
                                                         ipv4addr : *ip,
                                                 });
 
-                                                fdebug!("Reply {} in {} to  {}", m, s, peer);
+                                                jdebug!("Reply {} in {} to  {}", m, s, peer);
                                                 let _ = netinfo_send(&ih, Some(peer.clone()), m).await;
                                             }
                                         } else {
-                                            fdebug!("No IP found for {}", s);
+                                            jdebug!("No IP found for {}", s);
                                         }
 
                                         let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
@@ -278,10 +281,10 @@ impl NetIfMon {
                         }
                         Err(e) => {
                             if !peer.is_empty() {
-                                ferror!("Bad NetInfoReqMessage from {} : {}", peer, e);
+                                jerror!("Bad NetInfoReqMessage from {} : {}", peer, e);
                                 let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
                             } else {
-                                ferror!("Unexpectd NetInfoReqMessage : {}", e);
+                                jerror!("Unexpected NetInfoReqMessage : {}", e);
                             }
                         }
                     }
@@ -300,7 +303,7 @@ impl NetIfMon {
                 return Ok(true);
             }
             NetlinkPayload::Error(e) => {
-                ferror!("Error: {}", e);
+                jerror!("Error: {}", e);
                 return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
             }
             NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
@@ -319,11 +322,11 @@ impl NetIfMon {
                         flags: lm.header.flags,
                     });
 
-                    fdebug!("{}", msg);
+                    jdebug!("{}", msg);
 
                     if let Some(s) = &mut sender {
                         if let Err(e) = s.send(msg).await {
-                            ferror!("MPSC send error: {}", e);
+                            jerror!("MPSC send error: {}", e);
                         }
                     }
 
@@ -357,11 +360,11 @@ impl NetIfMon {
                         flags: lm.header.flags,
                     });
 
-                    fdebug!("{}", msg);
+                    jdebug!("{}", msg);
 
                     if let Some(s) = &mut sender {
                         if let Err(e) = s.send(msg).await {
-                            ferror!("MPSC send error: {}", e);
+                            jerror!("MPSC send error: {}", e);
                         }
                     }
 
@@ -378,15 +381,15 @@ impl NetIfMon {
                     if let Some(ntype) = self.netiftype_hash.get(&ifname) {
                         if let NetIfType::EthernetStaticIpv4(addr) = ntype {
                             if let Err(e) = netif.set_ipv4_addr(addr).await {
-                                ferror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
+                                jerror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
                             } else if let Err(e) = netif.set_netif_updown(true).await {
-                                ferror!("Failed to set {} UP: {}", ifname, e);
+                                jerror!("Failed to set {} UP: {}", ifname, e);
                             }
                         }
 
                         if let NetIfType::EthernetDHCP = ntype {
                             if let Err(e) = netif.enable_dhcp_client().await {
-                                ferror!("Failed to enable dhcp client for {}: {}", ifname, e);
+                                jerror!("Failed to enable dhcp client for {}: {}", ifname, e);
                             }
                         }
                     }
@@ -440,11 +443,11 @@ impl NetIfMon {
                             ipv4addr: addr,
                         });
 
-                        fdebug!("{}", msg);
+                        jdebug!("{}", msg);
 
                         if let Some(s) = &mut sender {
                             if let Err(e) = s.send(msg).await {
-                                ferror!("MPSC send error: {}", e);
+                                jerror!("MPSC send error: {}", e);
                             }
                         }
 
@@ -452,7 +455,7 @@ impl NetIfMon {
                             self.netiftype_hash.get(&ifname)
                         {
                             if addr_s == &addr {
-                                fwarn!("{} is removed from {}, try to reset it.", addr, ifname);
+                                jwarn!("{} is removed from {}, try to reset it.", addr, ifname);
 
                                 let netif = self.netif_hash.get_mut(&ifname).unwrap();
                                 /*
@@ -460,14 +463,14 @@ impl NetIfMon {
                                  * address has been set
                                  */
                                 if let Err(e) = netif.set_ipv4_addr(&addr).await {
-                                    ferror!(
+                                    jerror!(
                                         "Failed to set ip address {} to {}: {}",
                                         addr,
                                         ifname,
                                         e
                                     );
                                 } else if let Err(e) = netif.set_netif_updown(true).await {
-                                    ferror!("Failed to set {} UP: {}", ifname, e);
+                                    jerror!("Failed to set {} UP: {}", ifname, e);
                                 }
                             }
                         }
@@ -522,18 +525,18 @@ impl NetIfMon {
                             ipv4addr: addr,
                         });
 
-                        fdebug!("{}", msg);
+                        jdebug!("{}", msg);
 
                         if let Some(s) = &mut sender {
                             if let Err(e) = s.send(msg).await {
-                                ferror!("MPSC send error: {}", e);
+                                jerror!("MPSC send error: {}", e);
                             }
                         }
                     }
                 }
             }
             _ => {
-                fdebug!("Unexpectd msg");
+                jdebug!("Unexpected msg");
             }
         }
 

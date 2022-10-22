@@ -1,10 +1,13 @@
-mod logger;
+//cspell:word netif ifname iftype netifs jinfo jdebug jwarn jerror rnetmgr
 mod netif;
 mod netif_mon;
 
 use clap::{App, Arg};
+
+#[allow(unused)]
+use jlogger::{jdebug, jerror, jinfo, jwarn, JloggerBuilder};
+
 use log::LevelFilter;
-use logger::js_logger_init;
 use netif_mon::NetIfMon;
 use serde_derive::{Deserialize, Serialize};
 use std::fs;
@@ -52,44 +55,50 @@ fn main() {
                     .about("Log file"),
             )
             .arg(
-                Arg::new("verbos")
+                Arg::new("verbose")
                     .short('v')
                     .multiple_occurrences(true)
                     .about("Level of verbosity"),
             )
             .get_matches();
 
-        match matches.occurrences_of("verbos") {
-            0 => js_logger_init(matches.value_of("log-file"), LevelFilter::Info, false),
-            1 => js_logger_init(matches.value_of("log-file"), LevelFilter::Debug, false),
-            2 => js_logger_init(matches.value_of("log-file"), LevelFilter::Debug, true),
-            _ => js_logger_init(matches.value_of("log-file"), LevelFilter::Trace, true),
-        }
+        let max_level = match matches.occurrences_of("verbose") {
+            0 => LevelFilter::Info,
+            1 => LevelFilter::Debug,
+            2 => LevelFilter::Debug,
+            _ => LevelFilter::Trace,
+        };
+
+        JloggerBuilder::new()
+            .max_level(max_level)
+            .log_time(true)
+            .log_time_format(jlogger::LogTimeFormat::TimeStamp)
+            .build();
 
         let config_file = matches.value_of("config-file").unwrap();
 
-        finfo!("Use config: {}", config_file);
+        jinfo!("Use config: {}", config_file);
 
         let config_str = match fs::read_to_string(&config_file) {
             Ok(a) => a,
             Err(e) => {
-                ferror!("Open {} faled: {}", config_file, e);
+                jerror!("Open {} failed: {}", config_file, e);
                 std::process::exit(1);
             }
         };
 
-        fdebug!("{}", config_str);
+        jdebug!("{}", config_str);
 
         let config: NetIfConfig = match serde_json::from_str(&config_str) {
             Ok(a) => a,
             Err(e) => {
-                ferror!("Invalid configuration: {}.", e);
+                jerror!("Invalid configuration: {}.", e);
                 std::process::exit(1);
             }
         };
 
         if let Err(e) = NetIfMon::run(config).await {
-            ferror!("Error: {}", e);
+            jerror!("Error: {}", e);
         }
     };
 

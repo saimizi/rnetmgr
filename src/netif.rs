@@ -1,3 +1,5 @@
+//cspell:word netlink rtnl Netlink Rtnl nlas ipnetwork rnetmgr netinfo ifname
+//cspell:word NETIF ipaddr updown rtnetlink dhcpcd
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
@@ -19,8 +21,7 @@ use tokio::io::{Error, ErrorKind, Result};
 use rnetmgr_lib::netinfo::MacAddr;
 
 #[allow(unused)]
-use crate::{fdebug, ferror, finfo, ftrace, fwarn, NetIfConfig, NetIfConfigEntry};
-
+use jlogger::{jdebug, jerror, jinfo, jwarn};
 
 pub struct NetIf {
     ifname: String,
@@ -182,14 +183,14 @@ impl NetIf {
     }
 
     pub fn add_ipv4_addr(&mut self, ipaddr: &IpNetwork) {
-        ftrace!("Add {} to {}", ipaddr, self.ifname);
-        if ! self.ipv4.iter().any(|a| a == ipaddr) {
+        jdebug!("Add {} to {}", ipaddr, self.ifname);
+        if !self.ipv4.iter().any(|a| a == ipaddr) {
             self.ipv4.push(*ipaddr);
         }
     }
 
     pub fn del_ipv4_addr(&mut self, ipaddr: &IpNetwork) {
-        ftrace!("Del {} to {}", ipaddr, self.ifname);
+        jdebug!("Del {} to {}", ipaddr, self.ifname);
         self.ipv4.retain(|addr| addr != ipaddr);
     }
 
@@ -198,8 +199,8 @@ impl NetIf {
         self.flags
     }
 
-    pub fn update_flags(&mut self, newflag: u32) {
-        self.flags = newflag;
+    pub fn update_flags(&mut self, new_flag: u32) {
+        self.flags = new_flag;
     }
 
     pub async fn set_netif_updown(&self, up: bool) -> Result<()> {
@@ -228,7 +229,7 @@ impl NetIf {
         let (conn, handle, _) = rtnetlink::new_connection()?;
         tokio::spawn(conn);
 
-        fdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
+        jdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         if !self.is_valid() {
             return Err(Error::new(
                 ErrorKind::InvalidData,
@@ -255,7 +256,7 @@ impl NetIf {
     pub async fn enable_dhcp_client(&mut self) -> Result<()> {
         if let Some(dc) = &mut self.dhcp_client {
             if let Ok(None) = dc.try_wait() {
-                finfo!("dhcp clinet is running for {}\n", self.ifname);
+                jinfo!("dhcp client is running for {}\n", self.ifname);
                 return Ok(());
             }
         }
@@ -263,8 +264,8 @@ impl NetIf {
         let cmd = "/sbin/dhcpcd";
         let args = vec![String::from("-B"), self.ifname()];
 
-        finfo!("Start dhcp for {}", self.ifname);
-        finfo!("CMD: {} {}", cmd, args.join(" "));
+        jinfo!("Start dhcp for {}", self.ifname);
+        jinfo!("CMD: {} {}", cmd, args.join(" "));
         let c = Command::new(cmd).args(args).spawn()?;
         self.dhcp_client = Some(c);
 
