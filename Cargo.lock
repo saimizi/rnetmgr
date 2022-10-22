@@ -241,9 +241,9 @@ dependencies = [
 
 [[package]]
 name = "ipcon-sys"
-version = "0.1.1"
+version = "0.1.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "31a742f359e111ddd97b419fe9d6dcf62e6760b331a0dcc90a6caf5fd94455da"
+checksum = "09f503e1b9ed09151534ec0b74331e7a7f382b972d6d7403df2e2550201a7548"
 dependencies = [
  "bytes",
  "futures",

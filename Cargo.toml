@@ -32,7 +32,7 @@ jlogger = "0.1"
 tokio = {version = "1", features = ["full"]}
 cfg-if = "1.0.0"
 bytes = "1.1.0"
-ipcon-sys = { version="0.1.1", features = ["async"] }
+ipcon-sys = { version="0.1.2", features = ["async"] }
 
 [features]
 default = []
