@@ -2,7 +2,7 @@
 //cspell:word nifcfg netifs ifname RTNLGRP IFADDR nmsg addrs nlas ntype updown ipaddr iparray
 use crate::netif::NetIf;
 #[allow(unused)]
-use crate::{jerror, jinfo, jdebug, jwarn};
+use crate::{jdebug, jerror, jinfo, jwarn};
 use crate::{NetIfConfig, NetIfConfigEntry};
 use ipnetwork::{IpNetwork, Ipv4Network};
 #[allow(unused)]
@@ -29,10 +29,17 @@ use tokio::{
     sync::mpsc::{self, Sender},
 };
 
+#[cfg(feature = "enable_ipcon")]
 use bytes::Bytes;
-use ipcon_sys::ipcon::{IPF_RCV_IF, IPF_SND_IF};
-use ipcon_sys::ipcon_async::AsyncIpcon;
-use ipcon_sys::ipcon_msg::IpconMsg;
+
+#[cfg(feature = "enable_ipcon")]
+use ipcon_sys::{
+    ipcon::{IPF_RCV_IF, IPF_SND_IF},
+    ipcon_async::AsyncIpcon,
+    ipcon_msg::IpconMsg,
+};
+
+#[cfg(feature = "enable_ipcon")]
 use std::ffi::{CStr, CString};
 
 #[derive(PartialEq, Eq)]
@@ -98,6 +105,7 @@ impl Display for NetIfMon {
     }
 }
 
+#[cfg(feature = "enable_ipcon")]
 async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
     match ih.receive_msg().await {
         Ok(ipcon_msg) => {
@@ -129,6 +137,7 @@ async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
     }
 }
 
+#[cfg(feature = "enable_ipcon")]
 async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage) -> Result<()> {
     let buf = serde_json::to_string(&msg)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
@@ -215,13 +224,89 @@ impl NetIfMon {
 
         jinfo!("Start monitoring...");
 
-        let ih = AsyncIpcon::new(Some(NETINFO_IPCON), Some(IPF_RCV_IF | IPF_SND_IF))
-            .expect("Failed to create IPCON handler.");
+        #[cfg(feature = "enable_ipcon")]
+        {
+            let ih = AsyncIpcon::new(Some(NETINFO_IPCON), Some(IPF_RCV_IF | IPF_SND_IF))
+                .expect("Failed to create IPCON handler.");
 
-        ih.register_group(NETINFO_IPCON_GROUP)
-            .await
-            .expect("Failed to register rnetmgr group.");
+            ih.register_group(NETINFO_IPCON_GROUP)
+                .await
+                .expect("Failed to register rnetmgr group.");
 
+            loop {
+                tokio::select! {
+                    Some((msg, _)) = messages.next() => {
+                            if let Err(e) = netif_mon.update(msg, Some(&mut s)).await {
+                                jerror!("{}", e);
+                            }
+                    }
+
+                    Some(m) = r.recv() => {
+                            jinfo!("{}", m);
+                            if let Err(e) = netinfo_send(&ih, None, m).await {
+                                jerror!("{}", e);
+                            }
+                    }
+
+                    #[cfg(feature = "enable_ipcon")]
+                    (peer, ret) = netinfo_rcv(&ih) => {
+                        match ret {
+                            Ok(m) => {
+                                jdebug!("ReqMessage from {}", peer);
+                                match m {
+                                    NetInfoReqMessage::ReqLink(s) => {
+                                            let mut m = NetInfoMessage::NoInfo;
+
+                                            if let Some(nif) = netif_mon.netif_hash.get(&s) {
+                                                m = NetInfoMessage::NewLink(NetInfoNewLink {
+                                                        ifname : nif.ifname(),
+                                                        if_index : nif.if_index(),
+                                                        mac : nif.mac().clone(),
+                                                        flags : nif.flags(),
+                                                });
+                                            }
+
+                                            let _ = netinfo_send(&ih, Some(peer), m).await;
+                                    }
+                                    NetInfoReqMessage::ReqAddress(s) => {
+                                            jdebug!("ReqMessage from {} for {}", peer, s);
+                                            if let Some(nif) = netif_mon.netif_hash.get(&s) {
+                                                let iparray = nif.ipv4addr();
+                                                for ip in iparray.iter() {
+                                                    let m = NetInfoMessage::NewAddress(
+                                                        NetInfoNewAddress {
+                                                            ifname : nif.ifname(),
+                                                            if_index : nif.if_index(),
+                                                            ipv4addr : *ip,
+                                                    });
+
+                                                    jdebug!("Reply {} in {} to  {}", m, s, peer);
+                                                    let _ = netinfo_send(&ih, Some(peer.clone()), m).await;
+                                                }
+                                            } else {
+                                                jdebug!("No IP found for {}", s);
+                                            }
+
+                                            let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
+                                    }
+                                }
+                            }
+                            Err(e) => {
+                                if !peer.is_empty() {
+                                    jerror!("Bad NetInfoReqMessage from {} : {}", peer, e);
+                                    let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
+                                } else {
+                                    jerror!("Unexpected NetInfoReqMessage : {}", e);
+                                }
+                            }
+                        }
+                    }
+
+                }
+            }
+        }
+
+        #[cfg(not(feature = "enable_ipcon"))]
         loop {
             tokio::select! {
                 Some((msg, _)) = messages.next() => {
@@ -232,62 +317,6 @@ impl NetIfMon {
 
                 Some(m) = r.recv() => {
                         jinfo!("{}", m);
-                        if let Err(e) = netinfo_send(&ih, None, m).await {
-                            jerror!("{}", e);
-                        }
-                }
-
-                (peer, ret) = netinfo_rcv(&ih) => {
-                    match ret {
-                        Ok(m) => {
-                            jdebug!("ReqMessage from {}", peer);
-                            match m {
-                                NetInfoReqMessage::ReqLink(s) => {
-                                        let mut m = NetInfoMessage::NoInfo;
-
-                                        if let Some(nif) = netif_mon.netif_hash.get(&s) {
-                                            m = NetInfoMessage::NewLink(NetInfoNewLink {
-                                                    ifname : nif.ifname(),
-                                                    if_index : nif.if_index(),
-                                                    mac : nif.mac().clone(),
-                                                    flags : nif.flags(),
-                                            });
-                                        }
-
-                                        let _ = netinfo_send(&ih, Some(peer), m).await;
-                                }
-                                NetInfoReqMessage::ReqAddress(s) => {
-                                        jdebug!("ReqMessage from {} for {}", peer, s);
-                                        if let Some(nif) = netif_mon.netif_hash.get(&s) {
-                                            let iparray = nif.ipv4addr();
-                                            for ip in iparray.iter() {
-                                                let m = NetInfoMessage::NewAddress(
-                                                    NetInfoNewAddress {
-                                                        ifname : nif.ifname(),
-                                                        if_index : nif.if_index(),
-                                                        ipv4addr : *ip,
-                                                });
-
-                                                jdebug!("Reply {} in {} to  {}", m, s, peer);
-                                                let _ = netinfo_send(&ih, Some(peer.clone()), m).await;
-                                            }
-                                        } else {
-                                            jdebug!("No IP found for {}", s);
-                                        }
-
-                                        let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::NoInfo).await;
-                                }
-                            }
-                        }
-                        Err(e) => {
-                            if !peer.is_empty() {
-                                jerror!("Bad NetInfoReqMessage from {} : {}", peer, e);
-                                let _ = netinfo_send(&ih, Some(peer), NetInfoMessage::InvalidReq).await;
-                            } else {
-                                jerror!("Unexpected NetInfoReqMessage : {}", e);
-                            }
-                        }
-                    }
                 }
             }
         }

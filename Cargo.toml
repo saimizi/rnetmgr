@@ -31,8 +31,9 @@ log = "0.4"
 jlogger = "0.1"
 tokio = {version = "1", features = ["full"]}
 cfg-if = "1.0.0"
-bytes = "1.1.0"
-ipcon-sys = { version="0.1.2", features = ["async"] }
+bytes = {version = "1.1.0", optional = true }
+ipcon-sys = { version="0.1.2", features = ["async"], optional=true}
 
 [features]
 default = []
+enable_ipcon = ["ipcon-sys", "bytes" ]
