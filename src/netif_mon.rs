@@ -46,6 +46,7 @@ use std::ffi::{CStr, CString};
 enum NetIfType {
     EthernetDHCP,
     EthernetStaticIpv4(IpNetwork),
+    EthernetDHCPServerIpv4(IpNetwork),
     Invalid,
 }
 
@@ -57,6 +58,7 @@ impl Display for NetIfType {
             match self {
                 NetIfType::EthernetDHCP => "Ethernet+DHCP",
                 NetIfType::EthernetStaticIpv4(_) => "Ethernet+Static+Ipv4",
+                NetIfType::EthernetDHCPServerIpv4(_) => "Ethernet+DHCPServer+Ipv4",
                 NetIfType::Invalid => "Invalid",
             }
         )
@@ -72,14 +74,20 @@ impl NetIfType {
                 if let Some(ipv4) = &cfg.ipv4 {
                     if let Ok(ip) = ipv4.parse::<Ipv4Network>() {
                         iftype = NetIfType::EthernetStaticIpv4(IpNetwork::V4(ip));
-                    } else {
-                        return NetIfType::Invalid;
                     }
                 }
             }
 
             if cfg.addr_type == "DHCP" {
                 iftype = NetIfType::EthernetDHCP;
+            }
+
+            if cfg.addr_type == "DHCPServer" {
+                if let Some(ipv4) = &cfg.ipv4 {
+                    if let Ok(ip) = ipv4.parse::<Ipv4Network>() {
+                        iftype = NetIfType::EthernetDHCPServerIpv4(IpNetwork::V4(ip));
+                    }
+                }
             }
         }
 
@@ -408,17 +416,37 @@ impl NetIfMon {
                         .or_insert_with(|| NetIf::new(&ifname, if_index, mac, flags));
 
                     if let Some(ntype) = self.netiftype_hash.get(&ifname) {
+                        let mut ipaddr = None;
                         if let NetIfType::EthernetStaticIpv4(addr) = ntype {
-                            if let Err(e) = netif.set_ipv4_addr(addr).await {
-                                jerror!("Failed to set ip address {} to {}: {}", addr, ifname, e);
-                            } else if let Err(e) = netif.set_netif_updown(true).await {
-                                jerror!("Failed to set {} UP: {}", ifname, e);
-                            }
+                            ipaddr = Some(addr);
+                        }
+
+                        if let NetIfType::EthernetDHCPServerIpv4(addr) = ntype {
+                            ipaddr = Some(addr);
                         }
 
                         if let NetIfType::EthernetDHCP = ntype {
-                            if let Err(e) = netif.enable_dhcp_client().await {
-                                jerror!("Failed to enable dhcp client for {}: {}", ifname, e);
+                            if let Err(e) = netif.start_dhcp_client().await {
+                                jerror!("Failed to start dhcp client for {}: {}", ifname, e);
+                            }
+                        }
+
+                        if let Some(addr) = ipaddr {
+                            if netif.flags() & IFF_RUNNING == IFF_RUNNING {
+                                jinfo!("NetIf {} is UP, set IP address.", netif.ifname());
+                                if let Err(e) = netif.set_ipv4_addr(addr).await {
+                                    jerror!(
+                                        "Failed to set ip address {} to {}: {}",
+                                        addr,
+                                        ifname,
+                                        e
+                                    );
+                                }
+                            } else {
+                                jinfo!("NetIf {} is DOWN, bring UP", netif.ifname());
+                                if let Err(e) = netif.set_netif_updown(true).await {
+                                    jerror!("Failed to set {} UP: {}", ifname, e);
+                                }
                             }
                         }
                     }
@@ -535,13 +563,13 @@ impl NetIfMon {
 
                 if !ifname.is_empty() {
                     if let Some(addr) = ipaddr {
-                        let n = self
+                        let netif = self
                             .netif_hash
                             .entry(ifname.clone())
                             .and_modify(|n| n.add_ipv4_addr(&addr))
                             .or_default();
 
-                        if !n.is_valid() {
+                        if !netif.is_valid() {
                             return Err(Error::new(
                                 ErrorKind::Other,
                                 format!("NewAddress: netif {} is not found.", ifname),
@@ -550,7 +578,7 @@ impl NetIfMon {
 
                         let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
                             ifname: ifname.clone(),
-                            if_index: n.if_index(),
+                            if_index: netif.if_index(),
                             ipv4addr: addr,
                         });
 
@@ -559,6 +587,21 @@ impl NetIfMon {
                         if let Some(s) = &mut sender {
                             if let Err(e) = s.send(msg).await {
                                 jerror!("MPSC send error: {}", e);
+                            }
+                        }
+
+                        if let Some(ntype) = self.netiftype_hash.get(&ifname) {
+                            if let NetIfType::EthernetDHCPServerIpv4(ip) = ntype {
+                                if ip == &addr {
+                                    jinfo!("Found IP address {}, start DHCP server.", ip);
+                                    if let Err(e) = netif.start_dhcp_server(ip).await {
+                                        jerror!(
+                                            "Failed to start dhcp server for {}: {}",
+                                            ifname,
+                                            e
+                                        );
+                                    }
+                                }
                             }
                         }
                     }

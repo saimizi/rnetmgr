@@ -9,8 +9,8 @@
         {
             "ifname" : "eth0",
             "iftype" : "Ethernet",
-            "addr_type": "Static",
-            "ipv4" : "192.168.28.123"
+            "addr_type": "DHCPServer",
+            "ipv4" : "192.168.28.1/24"
         }
     ]
 }

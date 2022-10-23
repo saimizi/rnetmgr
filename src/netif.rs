@@ -1,5 +1,6 @@
 //cspell:word netlink rtnl Netlink Rtnl nlas ipnetwork rnetmgr netinfo ifname
-//cspell:word NETIF ipaddr updown rtnetlink dhcpcd
+//cspell:word NETIF ipaddr updown rtnetlink dhcpcd rfind dhcpv
+
 #[allow(unused)]
 use netlink_packet_route::{
     rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
@@ -10,18 +11,22 @@ use netlink_packet_route::{
 use rtnl::address::nlas::Nla as AddrNla;
 
 use ipnetwork::IpNetwork;
-
 use tokio::process::{Child, Command};
 
 #[allow(unused)]
 use rtnl::link::nlas::Nla as LinkNla;
 use std::fmt::{self, Display, Formatter};
-use tokio::io::{Error, ErrorKind, Result};
+use tokio::{
+    fs::File,
+    io::{AsyncWriteExt, Error, ErrorKind, Result},
+};
 
 use rnetmgr_lib::netinfo::MacAddr;
 
 #[allow(unused)]
 use jlogger::{jdebug, jerror, jinfo, jwarn};
+
+static DHCP_SERVER_CONF: &str = include_str!("dhcp4-template.conf");
 
 pub struct NetIf {
     ifname: String,
@@ -30,6 +35,7 @@ pub struct NetIf {
     flags: u32,
     if_index: u32,
     dhcp_client: Option<Child>,
+    dhcp_server: Option<Child>,
 }
 
 impl Default for NetIf {
@@ -41,6 +47,7 @@ impl Default for NetIf {
             flags: 0,
             if_index: NetIf::NETIF_INVALID_IF_INDEX,
             dhcp_client: None,
+            dhcp_server: None,
         }
     }
 }
@@ -117,6 +124,7 @@ impl NetIf {
             flags,
             if_index,
             dhcp_client: None,
+            dhcp_server: None,
         }
     }
 
@@ -253,7 +261,7 @@ impl NetIf {
             .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
     }
 
-    pub async fn enable_dhcp_client(&mut self) -> Result<()> {
+    pub async fn start_dhcp_client(&mut self) -> Result<()> {
         if let Some(dc) = &mut self.dhcp_client {
             if let Ok(None) = dc.try_wait() {
                 jinfo!("dhcp client is running for {}\n", self.ifname);
@@ -268,6 +276,49 @@ impl NetIf {
         jinfo!("CMD: {} {}", cmd, args.join(" "));
         let c = Command::new(cmd).args(args).spawn()?;
         self.dhcp_client = Some(c);
+
+        Ok(())
+    }
+
+    pub async fn start_dhcp_server(&mut self, ip: &IpNetwork) -> Result<()> {
+        if let Some(ds) = &mut self.dhcp_server {
+            if let Ok(None) = ds.try_wait() {
+                jinfo!("dhcp server is running for {}\n", self.ifname);
+                return Ok(());
+            }
+        }
+
+        let ip_str = ip.ip().to_string();
+        let prefix_str = ip.prefix().to_string();
+        let subnet_str = format!("{}/{}", ip.network().to_string(), prefix_str);
+        let pos = ip_str.rfind('.').unwrap();
+        let start = format!("{}.{}", &ip_str[0..pos], 10);
+        let end = format!("{}.{}", &ip_str[0..pos], 240);
+
+        let interface = format!("{}", &self.ifname);
+
+        let conf_str = DHCP_SERVER_CONF
+            .replace("@INTERFACE@", &interface)
+            .replace("@SUBNET@", &subnet_str)
+            .replace("@START@", &start)
+            .replace("@END@", &end)
+            .replace("@GATEWAY_IP@", &ip_str);
+
+        let conf_file = format!("/tmp/dhcpv4_{}.conf", self.ifname);
+        let mut file = File::create(&conf_file).await?;
+        file.write_all(conf_str.as_bytes()).await?;
+
+        let _ = tokio::fs::create_dir("/var/run/kea").await;
+        let _ = tokio::fs::create_dir("/var/lib/kea").await;
+
+        jinfo!("{}", conf_str);
+        let cmd = "/usr/sbin/kea-dhcp4";
+        let args = vec![String::from("-c"), conf_file];
+
+        jinfo!("Start dhcp server for {}", self.ifname);
+        jinfo!("CMD: {} {}", cmd, args.join(" "));
+        let c = Command::new(cmd).args(args).spawn()?;
+        self.dhcp_server = Some(c);
 
         Ok(())
     }
