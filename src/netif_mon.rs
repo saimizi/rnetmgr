@@ -256,7 +256,6 @@ impl NetIfMon {
                             }
                     }
 
-                    #[cfg(feature = "enable_ipcon")]
                     (peer, ret) = netinfo_rcv(&ih) => {
                         match ret {
                             Ok(m) => {
