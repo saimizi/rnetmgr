@@ -1,4 +1,4 @@
-//cspell:word netif ifname iftype netifs jinfo jdebug jwarn jerror rnetmgr
+//cspell:word netif ifname iftype netifs jinfo jdebug jwarn jerror rnetmgr routeif
 mod netif;
 mod netif_mon;
 
@@ -18,6 +18,7 @@ pub struct NetIfConfigEntry {
     iftype: String,
     addr_type: String,
     ipv4: Option<String>,
+    routeif: Option<String>,
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]

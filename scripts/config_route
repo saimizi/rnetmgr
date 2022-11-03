@@ -1,0 +1,39 @@
+#!/bin/bash
+
+ethi=$1
+etho=$2
+
+function clear_all_tables ()
+{
+	iptables -F
+	iptables -t nat -F
+	iptables -X
+}
+
+clear_all_tables
+
+# enable IP masquerade
+iptables -t nat -A POSTROUTING -o ${etho} -j MASQUERADE
+
+# forbiden connection from the external network
+#iptables -A INPUT -i ${etho} -j REJECT
+
+# permit message to the external network
+iptables -A OUTPUT -o ${etho} -j ACCEPT
+
+# permit internal network
+iptables -A INPUT -i ${ethi} -j ACCEPT
+iptables -A OUTPUT -o ${ethi} -j ACCEPT
+
+# permit loop back network
+iptables -A INPUT -i lo -j ACCEPT
+iptables -A OUTPUT -o lo -j ACCEPT
+
+# permit data from internal network to external network
+iptables -A FORWARD -i ${ethi} -o ${etho} -j ACCEPT
+
+# Only permit response packets from external to internal network
+#iptables -A FORWARD -m state --state ESTABLISHED,RELATED -j ACCEPT
+
+# enable IP forward
+echo 1 > /proc/sys/net/ipv4/ip_forward

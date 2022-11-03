@@ -1,5 +1,6 @@
 //cspell:word netif ipnetwork rnetmgr netinfo IPCON rtnl Netlink Rtnl rtnetlink iftype netiftype
 //cspell:word nifcfg netifs ifname RTNLGRP IFADDR nmsg addrs nlas ntype updown ipaddr iparray
+//cspell:word routeif
 use crate::netif::NetIf;
 #[allow(unused)]
 use crate::{jdebug, jerror, jinfo, jwarn};
@@ -26,6 +27,7 @@ use std::collections::HashMap;
 use std::fmt::{self, Display, Formatter};
 use tokio::{
     io::{Error, ErrorKind, Result},
+    process::Command,
     sync::mpsc::{self, Sender},
 };
 
@@ -42,11 +44,24 @@ use ipcon_sys::{
 #[cfg(feature = "enable_ipcon")]
 use std::ffi::{CStr, CString};
 
+struct DHCPServerIpv4Config {
+    ipv4: IpNetwork,
+    routeif: Option<String>,
+}
+
+impl PartialEq for DHCPServerIpv4Config {
+    fn eq(&self, other: &Self) -> bool {
+        self.ipv4 == other.ipv4
+    }
+}
+
+impl Eq for DHCPServerIpv4Config {}
+
 #[derive(PartialEq, Eq)]
 enum NetIfType {
     EthernetDHCP,
     EthernetStaticIpv4(IpNetwork),
-    EthernetDHCPServerIpv4(IpNetwork),
+    EthernetDHCPServerIpv4(DHCPServerIpv4Config),
     Invalid,
 }
 
@@ -83,9 +98,17 @@ impl NetIfType {
             }
 
             if cfg.addr_type == "DHCPServer" {
+                let routeif = match &cfg.routeif {
+                    Some(s) => Some(s.clone()),
+                    None => None,
+                };
+
                 if let Some(ipv4) = &cfg.ipv4 {
                     if let Ok(ip) = ipv4.parse::<Ipv4Network>() {
-                        iftype = NetIfType::EthernetDHCPServerIpv4(IpNetwork::V4(ip));
+                        iftype = NetIfType::EthernetDHCPServerIpv4(DHCPServerIpv4Config {
+                            ipv4: IpNetwork::V4(ip),
+                            routeif,
+                        });
                     }
                 }
             }
@@ -420,8 +443,8 @@ impl NetIfMon {
                             ipaddr = Some(addr);
                         }
 
-                        if let NetIfType::EthernetDHCPServerIpv4(addr) = ntype {
-                            ipaddr = Some(addr);
+                        if let NetIfType::EthernetDHCPServerIpv4(cfg) = ntype {
+                            ipaddr = Some(&cfg.ipv4);
                         }
 
                         if let NetIfType::EthernetDHCP = ntype {
@@ -590,7 +613,8 @@ impl NetIfMon {
                         }
 
                         if let Some(ntype) = self.netiftype_hash.get(&ifname) {
-                            if let NetIfType::EthernetDHCPServerIpv4(ip) = ntype {
+                            if let NetIfType::EthernetDHCPServerIpv4(cfg) = ntype {
+                                let ip = &cfg.ipv4;
                                 if ip == &addr {
                                     jinfo!("Found IP address {}, start DHCP server.", ip);
                                     if let Err(e) = netif.start_dhcp_server(ip).await {
@@ -599,6 +623,14 @@ impl NetIfMon {
                                             ifname,
                                             e
                                         );
+                                    } else {
+                                        if let Some(routeif) = &cfg.routeif {
+                                            let cmd = "/usr/bin/config_route";
+                                            let args = vec![ifname, routeif.clone()];
+
+                                            jinfo!("Setup route to {}", routeif);
+                                            let _ = Command::new(cmd).args(args).spawn()?;
+                                        }
                                     }
                                 }
                             }
