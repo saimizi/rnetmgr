@@ -5,12 +5,15 @@ mod netif_mon;
 use clap::{App, Arg};
 
 #[allow(unused)]
-use jlogger::{jdebug, jerror, jinfo, jwarn, JloggerBuilder};
-
-use log::LevelFilter;
-use netif_mon::NetIfMon;
-use serde_derive::{Deserialize, Serialize};
-use std::fs;
+use {
+    jlogger_tracing::{
+        jdebug, jerror, jinfo, jtrace, jwarn, JloggerBuilder, LevelFilter, LogTimeFormat,
+    },
+    netif_mon::NetIfMon,
+    serde_derive::{Deserialize, Serialize},
+    std::fs,
+    error_stack::{IntoReport, Report, Result, ResultExt},
+};
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct NetIfConfigEntry {
@@ -64,16 +67,14 @@ fn main() {
             .get_matches();
 
         let max_level = match matches.occurrences_of("verbose") {
-            0 => LevelFilter::Info,
-            1 => LevelFilter::Debug,
-            2 => LevelFilter::Debug,
-            _ => LevelFilter::Trace,
+            1 => LevelFilter::DEBUG,
+            2 => LevelFilter::TRACE,
+            _ => LevelFilter::INFO,
         };
 
         JloggerBuilder::new()
             .max_level(max_level)
-            .log_time(true)
-            .log_time_format(jlogger::LogTimeFormat::TimeStamp)
+            .log_time(LogTimeFormat::TimeStamp)
             .build();
 
         let config_file = matches.value_of("config-file").unwrap();
@@ -99,7 +100,7 @@ fn main() {
         };
 
         if let Err(e) = NetIfMon::run(config).await {
-            jerror!("Error: {}", e);
+            jerror!("Error: {:?}", e);
         }
     };
 

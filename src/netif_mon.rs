@@ -1,38 +1,38 @@
 //cspell:word netif ipnetwork rnetmgr netinfo IPCON rtnl Netlink Rtnl rtnetlink iftype netiftype
 //cspell:word nifcfg netifs ifname RTNLGRP IFADDR nmsg addrs nlas ntype updown ipaddr iparray
 //cspell:word routeif
-use crate::netif::NetIf;
-#[allow(unused)]
-use crate::{jdebug, jerror, jinfo, jwarn};
-use crate::{NetIfConfig, NetIfConfigEntry};
-use ipnetwork::{IpNetwork, Ipv4Network};
-#[allow(unused)]
-use rnetmgr_lib::netinfo::{
-    MacAddr, NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress, NetInfoNewLink,
-    NetInfoReqMessage, NETINFO_IPCON, NETINFO_IPCON_GROUP,
-};
 
 #[allow(unused)]
-use netlink_packet_route::{
-    constants::*, rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader,
-    NetlinkMessage, NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL,
-    NLM_F_REQUEST,
+use {
+    super::netif::NetIf,
+    super::{NetIfConfig, NetIfConfigEntry},
+    error_stack::{IntoReport, Report, Result, ResultExt},
+    futures::stream::StreamExt,
+    futures::TryStreamExt,
+    ipnetwork::{IpNetwork, Ipv4Network},
+    jlogger_tracing::{
+        jdebug, jerror, jinfo, jtrace, jwarn, JloggerBuilder, LevelFilter, LogTimeFormat,
+    },
+    netlink_packet_route::{
+        constants::*, rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader,
+        NetlinkMessage, NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
+        NLM_F_EXCL, NLM_F_REQUEST,
+    },
+    rnetmgr_lib::netinfo::{
+        MacAddr, NetInfoDelAddress, NetInfoDelLink, NetInfoMessage, NetInfoNewAddress,
+        NetInfoNewLink, NetInfoReqMessage, NETINFO_IPCON, NETINFO_IPCON_GROUP,
+    },
+    rtnetlink::sys::{AsyncSocket, SocketAddr},
+    std::{
+        collections::HashMap,
+        fmt::{self, Display, Formatter},
+    },
+    tokio::{
+        io::{Error, ErrorKind},
+        process::Command,
+        sync::mpsc::{self, Sender},
+    },
 };
-
-use futures::stream::StreamExt;
-use futures::TryStreamExt;
-use rtnetlink::sys::{AsyncSocket, SocketAddr};
-
-use std::collections::HashMap;
-use std::fmt::{self, Display, Formatter};
-use tokio::{
-    io::{Error, ErrorKind, Result},
-    process::Command,
-    sync::mpsc::{self, Sender},
-};
-
-#[cfg(feature = "enable_ipcon")]
-use bytes::Bytes;
 
 #[cfg(feature = "enable_ipcon")]
 use ipcon_sys::{
@@ -137,21 +137,31 @@ impl Display for NetIfMon {
 }
 
 #[cfg(feature = "enable_ipcon")]
-async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
+async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage, Error>) {
     match ih.receive_msg().await {
         Ok(ipcon_msg) => {
             if let IpconMsg::IpconMsgUser(body) = ipcon_msg {
-                match unsafe { CStr::from_ptr(body.buf.as_ptr() as *const i8).to_str() } {
+                match {
+                    #[cfg(target_arch = "aarch64")]
+                    unsafe {
+                        CStr::from_ptr(body.buf.as_ptr()).to_str()
+                    }
+
+                    #[cfg(target_arch = "x86_64")]
+                    unsafe {
+                        CStr::from_ptr(body.buf.as_ptr() as *const i8).to_str()
+                    }
+                } {
                     Ok(s) => match serde_json::from_str::<NetInfoReqMessage>(s) {
                         Ok(req) => (body.peer, Ok(req)),
                         Err(e) => (
                             body.peer,
-                            Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                            Err(Error::new(ErrorKind::InvalidData, format!("{}", e))).into_report(),
                         ),
                     },
                     Err(e) => (
                         body.peer,
-                        Err(Error::new(ErrorKind::InvalidData, format!("{}", e))),
+                        Err(Error::new(ErrorKind::InvalidData, format!("{}", e))).into_report(),
                     ),
                 }
             } else {
@@ -160,16 +170,24 @@ async fn netinfo_rcv(ih: &AsyncIpcon) -> (String, Result<NetInfoReqMessage>) {
                     Err(Error::new(
                         ErrorKind::InvalidData,
                         "Invalid NetInfoReqMessage",
-                    )),
+                    ))
+                    .into_report(),
                 )
             }
         }
-        Err(e) => (String::new(), Err(e)),
+        Err(e) => (
+            String::new(),
+            Err(e.change_context(Error::new(ErrorKind::Other, "IPCON error"))),
+        ),
     }
 }
 
 #[cfg(feature = "enable_ipcon")]
-async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage) -> Result<()> {
+async fn netinfo_send(
+    ih: &AsyncIpcon,
+    peer: Option<String>,
+    msg: NetInfoMessage,
+) -> Result<(), Error> {
     let buf = serde_json::to_string(&msg)
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("Serialize error {}", e)))?;
 
@@ -183,20 +201,18 @@ async fn netinfo_send(ih: &AsyncIpcon, peer: Option<String>, msg: NetInfoMessage
         .map_err(|e| Error::new(ErrorKind::InvalidData, format!("CString trans error {}", e)))?;
 
     if let Some(p) = &peer {
-        ih.send_unicast_msg(p, Bytes::from(c_buf.into_bytes_with_nul()))
+        ih.send_unicast_msg(p, &c_buf.into_bytes_with_nul())
             .await
+            .change_context(Error::new(ErrorKind::Other, "IPCON error"))
     } else {
-        ih.send_multicast(
-            NETINFO_IPCON_GROUP,
-            Bytes::from(c_buf.into_bytes_with_nul()),
-            false,
-        )
-        .await
+        ih.send_multicast(NETINFO_IPCON_GROUP, &c_buf.into_bytes_with_nul(), false)
+            .await
+            .change_context(Error::new(ErrorKind::Other, "IPCON error"))
     }
 }
 
 impl NetIfMon {
-    pub async fn run(nifcfg: NetIfConfig) -> Result<()> {
+    pub async fn run(nifcfg: NetIfConfig) -> Result<(), Error> {
         let mut netiftype_hash = HashMap::<String, NetIfType>::new();
 
         for cfg in nifcfg.netifs {
@@ -205,7 +221,8 @@ impl NetIfMon {
                 return Err(Error::new(
                     ErrorKind::InvalidInput,
                     format!("Invalid netif type for {}", cfg.ifname),
-                ));
+                ))
+                .into_report();
             }
             netiftype_hash.insert(cfg.ifname.clone(), netif_type);
         }
@@ -356,14 +373,14 @@ impl NetIfMon {
         &mut self,
         msg: NetlinkMessage<RtnlMessage>,
         mut sender: Option<&mut Sender<NetInfoMessage>>,
-    ) -> Result<bool> {
+    ) -> Result<bool, Error> {
         match msg.payload {
             NetlinkPayload::Done => {
                 return Ok(true);
             }
             NetlinkPayload::Error(e) => {
                 jerror!("Error: {}", e);
-                return Err(Error::new(ErrorKind::Other, format!("Error: {}", e)));
+                return Err(Error::new(ErrorKind::Other, format!("Error: {}", e))).into_report();
             }
             NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
                 let mut ifname = String::new();
@@ -513,7 +530,8 @@ impl NetIfMon {
                             return Err(Error::new(
                                 ErrorKind::Other,
                                 format!("DelAddress: netif {} is not found.", ifname),
-                            ));
+                            ))
+                            .into_report();
                         }
 
                         let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
@@ -595,7 +613,8 @@ impl NetIfMon {
                             return Err(Error::new(
                                 ErrorKind::Other,
                                 format!("NewAddress: netif {} is not found.", ifname),
-                            ));
+                            ))
+                            .into_report();
                         }
 
                         let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {

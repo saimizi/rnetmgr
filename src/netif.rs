@@ -2,29 +2,25 @@
 //cspell:word NETIF ipaddr updown rtnetlink dhcpcd rfind dhcpv
 
 #[allow(unused)]
-use netlink_packet_route::{
-    rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader, NetlinkMessage,
-    NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP, NLM_F_EXCL, NLM_F_REQUEST,
+use {
+    ipnetwork::IpNetwork,
+    jlogger_tracing::{
+        jdebug, jerror, jinfo, jtrace, jwarn, JloggerBuilder, LevelFilter, LogTimeFormat,
+    },
+    netlink_packet_route::{
+        rtnl, AddressHeader, AddressMessage, LinkHeader, LinkMessage, NetlinkHeader,
+        NetlinkMessage, NetlinkPayload, RtnlMessage, NLM_F_ACK, NLM_F_CREATE, NLM_F_DUMP,
+        NLM_F_EXCL, NLM_F_REQUEST,
+    },
+    rnetmgr_lib::netinfo::MacAddr,
+    rtnl::{address::nlas::Nla as AddrNla, link::nlas::Nla as LinkNla},
+    std::fmt::{self, Display, Formatter},
+    tokio::{
+        fs::File,
+        io::{AsyncWriteExt, Error, ErrorKind, Result},
+        process::{Child, Command},
+    },
 };
-
-#[allow(unused)]
-use rtnl::address::nlas::Nla as AddrNla;
-
-use ipnetwork::IpNetwork;
-use tokio::process::{Child, Command};
-
-#[allow(unused)]
-use rtnl::link::nlas::Nla as LinkNla;
-use std::fmt::{self, Display, Formatter};
-use tokio::{
-    fs::File,
-    io::{AsyncWriteExt, Error, ErrorKind, Result},
-};
-
-use rnetmgr_lib::netinfo::MacAddr;
-
-#[allow(unused)]
-use jlogger::{jdebug, jerror, jinfo, jwarn};
 
 static DHCP_SERVER_CONF: &str = include_str!("dhcp4-template.conf");
 
