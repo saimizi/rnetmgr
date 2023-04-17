@@ -1,8 +1,7 @@
-//cspell:word netlink rtnl Netlink Rtnl nlas ipnetwork rnetmgr netinfo ifname
-//cspell:word NETIF ipaddr updown rtnetlink dhcpcd rfind dhcpv
-
 #[allow(unused)]
 use {
+    super::rnetmgr_error::RnetmgrError,
+    error_stack::{IntoReport, Report, Result, ResultExt},
     ipnetwork::IpNetwork,
     jlogger_tracing::{
         jdebug, jerror, jinfo, jtrace, jwarn, JloggerBuilder, LevelFilter, LogTimeFormat,
@@ -17,12 +16,10 @@ use {
     std::fmt::{self, Display, Formatter},
     tokio::{
         fs::File,
-        io::{AsyncWriteExt, Error, ErrorKind, Result},
+        io::AsyncWriteExt,
         process::{Child, Command},
     },
 };
-
-static DHCP_SERVER_CONF: &str = include_str!("dhcp4-template.conf");
 
 pub struct NetIf {
     ifname: String,
@@ -207,8 +204,11 @@ impl NetIf {
         self.flags = new_flag;
     }
 
-    pub async fn set_netif_updown(&self, up: bool) -> Result<()> {
-        let (conn, handle, _) = rtnetlink::new_connection()?;
+    pub async fn set_netif_updown(&self, up: bool) -> Result<(), RnetmgrError> {
+        let (conn, handle, _) = rtnetlink::new_connection()
+            .into_report()
+            .change_context(RnetmgrError::RtNetlinkError)?;
+
         tokio::spawn(conn);
         if up {
             handle
@@ -217,7 +217,8 @@ impl NetIf {
                 .up()
                 .execute()
                 .await
-                .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
+                .into_report()
+                .change_context(RnetmgrError::RtNetlinkError)
         } else {
             handle
                 .link()
@@ -225,20 +226,23 @@ impl NetIf {
                 .down()
                 .execute()
                 .await
-                .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
+                .into_report()
+                .change_context(RnetmgrError::RtNetlinkError)
         }
     }
 
-    pub async fn set_ipv4_addr(&self, ipaddr: &IpNetwork) -> Result<()> {
-        let (conn, handle, _) = rtnetlink::new_connection()?;
+    pub async fn set_ipv4_addr(&self, ipaddr: &IpNetwork) -> Result<(), RnetmgrError> {
+        let (conn, handle, _) = rtnetlink::new_connection()
+            .into_report()
+            .change_context(RnetmgrError::RtNetlinkError)?;
+
         tokio::spawn(conn);
 
         jdebug!("Set IPv4 addr {} for {}", ipaddr, self.ifname);
         if !self.is_valid() {
-            return Err(Error::new(
-                ErrorKind::InvalidData,
-                format!("Invalid netif {}", self.ifname),
-            ));
+            return Err(RnetmgrError::InvalidValue)
+                .into_report()
+                .attach_printable(format!("Invalid netif {}", self.ifname));
         }
 
         if self
@@ -254,10 +258,11 @@ impl NetIf {
             .add(self.if_index, ipaddr.ip(), ipaddr.prefix())
             .execute()
             .await
-            .map_err(|e| Error::new(ErrorKind::Other, format!("rtnetlink error: {}", e)))
+            .into_report()
+            .change_context(RnetmgrError::RtNetlinkError)
     }
 
-    pub async fn start_dhcp_client(&mut self) -> Result<()> {
+    pub async fn start_dhcp_client(&mut self) -> Result<(), RnetmgrError> {
         if let Some(dc) = &mut self.dhcp_client {
             if let Ok(None) = dc.try_wait() {
                 jinfo!("dhcp client is running for {}\n", self.ifname);
@@ -269,14 +274,24 @@ impl NetIf {
         let args = vec![String::from("-B"), self.ifname()];
 
         jinfo!("Start dhcp for {}", self.ifname);
-        jinfo!("CMD: {} {}", cmd, args.join(" "));
-        let c = Command::new(cmd).args(args).spawn()?;
+        let cmd_str = format!("{} {}", cmd, args.join(" "));
+        jinfo!("CMD: {}", cmd_str);
+        let c = Command::new(cmd)
+            .args(args)
+            .spawn()
+            .into_report()
+            .change_context(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to run command {}", cmd_str))?;
         self.dhcp_client = Some(c);
 
         Ok(())
     }
 
-    pub async fn start_dhcp_server(&mut self, ip: &IpNetwork) -> Result<()> {
+    pub async fn start_dhcp_server(
+        &mut self,
+        ip: &IpNetwork,
+        dhcp_conf: &str,
+    ) -> Result<(), RnetmgrError> {
         if let Some(ds) = &mut self.dhcp_server {
             if let Ok(None) = ds.try_wait() {
                 jinfo!("dhcp server is running for {}\n", self.ifname);
@@ -293,7 +308,7 @@ impl NetIf {
 
         let interface = format!("{}", &self.ifname);
 
-        let conf_str = DHCP_SERVER_CONF
+        let conf_str = dhcp_conf
             .replace("@INTERFACE@", &interface)
             .replace("@SUBNET@", &subnet_str)
             .replace("@START@", &start)
@@ -301,8 +316,17 @@ impl NetIf {
             .replace("@GATEWAY_IP@", &ip_str);
 
         let conf_file = format!("/tmp/dhcpv4_{}.conf", self.ifname);
-        let mut file = File::create(&conf_file).await?;
-        file.write_all(conf_str.as_bytes()).await?;
+        let mut file = File::create(&conf_file)
+            .await
+            .into_report()
+            .change_context(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to create {}", conf_file))?;
+
+        file.write_all(conf_str.as_bytes())
+            .await
+            .into_report()
+            .change_context(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to write file {}", conf_str))?;
 
         let _ = tokio::fs::create_dir("/var/run/kea").await;
         let _ = tokio::fs::create_dir("/var/lib/kea").await;
@@ -312,8 +336,14 @@ impl NetIf {
         let args = vec![String::from("-c"), conf_file];
 
         jinfo!("Start dhcp server for {}", self.ifname);
-        jinfo!("CMD: {} {}", cmd, args.join(" "));
-        let c = Command::new(cmd).args(args).spawn()?;
+        let cmd_str = format!("{} {}", cmd, args.join(" "));
+        jinfo!("CMD: {}", cmd_str);
+        let c = Command::new(cmd)
+            .args(args)
+            .spawn()
+            .into_report()
+            .change_context(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to run command {}", cmd_str))?;
         self.dhcp_server = Some(c);
 
         Ok(())

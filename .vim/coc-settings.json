@@ -1,5 +1,22 @@
 {
   "cSpell.words": [
-    "rnetmgr"
+    "IFADDR",
+    "RTNLGRP",
+    "Rtnetlink",
+    "addrs",
+    "dhcpv",
+    "iftype",
+    "ipnetwork",
+    "netif",
+    "netifs",
+    "netiftype",
+    "nifcfg",
+    "nlas",
+    "nmsg",
+    "ntype",
+    "rnetmgr",
+    "routeif",
+    "rtnl",
+    "updown"
   ]
 }
