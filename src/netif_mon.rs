@@ -3,7 +3,7 @@ use {
     super::netif::NetIf,
     super::rnetmgr_error::RnetmgrError,
     super::{NetIfConfig, NetIfConfigEntry},
-    error_stack::{IntoReport, Report, Result, ResultExt},
+    error_stack::{Report, Result, ResultExt},
     futures::stream::StreamExt,
     futures::TryStreamExt,
     ipnetwork::{IpNetwork, Ipv4Network},
@@ -217,12 +217,15 @@ impl NetIfMon {
         let mut netiftype_hash = HashMap::<String, NetIfType>::new();
 
         for cfg in nifcfg.netifs {
-            netiftype_hash.insert(cfg.ifname.clone(), NetIfType::try_from(&cfg).into_report()?);
+            netiftype_hash.insert(
+                cfg.ifname.clone(),
+                NetIfType::try_from(&cfg)
+                    .map_err(|e| Report::new(RnetmgrError::InvalidValue).attach_printable(e))?,
+            );
         }
 
         let (mut conn, handle, mut messages) = rtnetlink::new_connection()
-            .into_report()
-            .change_context(RnetmgrError::RtNetlinkError)?;
+            .map_err(|e| Report::new(RnetmgrError::RtNetlinkError).attach_printable(e))?;
 
         let groups = 1 << (RTNLGRP_LINK - 1) | 1 << (RTNLGRP_IPV4_IFADDR - 1);
         jdebug!("group: {}", groups);
@@ -232,9 +235,7 @@ impl NetIfMon {
         conn.socket_mut()
             .socket_mut()
             .bind(&addr)
-            .into_report()
-            .change_context(RnetmgrError::SocketError)
-            .attach_printable(format!("Failed to bind {}", addr))?;
+            .map_err(|e| Report::new(RnetmgrError::SocketError).attach_printable(e))?;
 
         tokio::spawn(conn);
 
@@ -249,9 +250,7 @@ impl NetIfMon {
         while let Some(lm) = links
             .try_next()
             .await
-            .into_report()
-            .change_context(RnetmgrError::RtNetlinkError)
-            .attach_printable("Get Link error")?
+            .map_err(|e| Report::new(RnetmgrError::RtNetlinkError).attach_printable(e))?
         {
             let nmsg = NetlinkMessage {
                 header: NetlinkHeader::default(),
@@ -266,9 +265,7 @@ impl NetIfMon {
         while let Some(am) = addrs
             .try_next()
             .await
-            .into_report()
-            .change_context(RnetmgrError::RtNetlinkError)
-            .attach_printable("Get Link error")?
+            .map_err(|e| Report::new(RnetmgrError::RtNetlinkError).attach_printable(e))?
         {
             let nmsg = NetlinkMessage {
                 header: NetlinkHeader::default(),
@@ -387,9 +384,9 @@ impl NetIfMon {
                 return Ok(true);
             }
             NetlinkPayload::Error(e) => {
-                return Err(RnetmgrError::RtNetlinkError)
-                    .into_report()
-                    .attach_printable(format!("{}", e));
+                return Err(
+                    Report::new(RnetmgrError::RtNetlinkError).attach_printable(format!("{}", e))
+                );
             }
 
             NetlinkPayload::InnerMessage(RtnlMessage::DelLink(lm)) => {
@@ -537,12 +534,11 @@ impl NetIfMon {
                             .or_default();
 
                         if !n.is_valid() {
-                            return Err(RnetmgrError::RtNetlinkError)
-                                .into_report()
+                            return Err(Report::new(RnetmgrError::RtNetlinkError)
                                 .attach_printable(format!(
                                     "DelAddress: netif {} is not found.",
                                     ifname
-                                ));
+                                )));
                         }
 
                         let msg = NetInfoMessage::DelAddress(NetInfoDelAddress {
@@ -621,12 +617,11 @@ impl NetIfMon {
                             .or_default();
 
                         if !netif.is_valid() {
-                            return Err(RnetmgrError::RtNetlinkError)
-                                .into_report()
+                            return Err(Report::new(RnetmgrError::RtNetlinkError)
                                 .attach_printable(format!(
                                     "NewAddress: netif {} is not found.",
                                     ifname
-                                ));
+                                )));
                         }
 
                         let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
@@ -650,15 +645,15 @@ impl NetIfMon {
                                     jinfo!("Found IP address {}, start DHCP server.", ip);
                                     netif.start_dhcp_server(ip, self.dhcp_conf.as_str()).await?;
                                     if let Some(routeif) = &cfg.routeif {
-                                        let cmd = "/usr/bin/config_route";
+                                        let cmd = "/usr/sbin/config_route";
                                         let args = vec![ifname, routeif.clone()];
 
                                         jinfo!("Setup route to {}", routeif);
-                                        let _ = Command::new(cmd)
-                                            .args(args)
-                                            .spawn()
-                                            .into_report()
-                                            .change_context(RnetmgrError::SystemError)?;
+                                        let _ =
+                                            Command::new(cmd).args(args).spawn().map_err(|e| {
+                                                Report::new(RnetmgrError::SystemError)
+                                                    .attach_printable(e)
+                                            })?;
                                     }
                                 }
                             }

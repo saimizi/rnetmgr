@@ -30,7 +30,7 @@ tokio = {version = "1", features = ["full"]}
 cfg-if = "1.0.0"
 bytes = {version = "1.1.0", optional = true }
 ipcon-sys = { version="0.2.2", features = ["async"], optional=true}
-error-stack = "0.3.1"
+error-stack = "0.4"
 jlogger-tracing = "0.1.4"
 tracing = "0.1.37"
 clap = { version = "3.1.6", features = ["derive"] }

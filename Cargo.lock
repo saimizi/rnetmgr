@@ -4,9 +4,9 @@ version = 3
 
 [[package]]
 name = "anyhow"
-version = "1.0.70"
+version = "1.0.75"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "7de8ce5e0f9f8d88245311066a578d72b7af3e7088f32783804676302df237e4"
+checksum = "a4668cab20f66d8d020e1fbc0ebe47217433c1b6c8f2040faf858554e394ace6"
 
 [[package]]
 name = "atty"
@@ -119,6 +119,16 @@ name = "error-stack"
 version = "0.3.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "5f00447f331c7f726db5b8532ebc9163519eed03c6d7c8b73c90b3ff5646ac85"
+dependencies = [
+ "anyhow",
+ "rustc_version",
+]
+
+[[package]]
+name = "error-stack"
+version = "0.4.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "27a72baa257b5e0e2de241967bc5ee8f855d6072351042688621081d66b2a76b"
 dependencies = [
  "anyhow",
  "rustc_version",
@@ -260,7 +270,7 @@ version = "0.2.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "b74850495e0240b4d701fe770a25fab7d8cb843ecf70a35f5361a3a037786106"
 dependencies = [
- "error-stack",
+ "error-stack 0.3.1",
  "futures",
  "jlogger-tracing",
  "libc",
@@ -593,9 +603,9 @@ dependencies = [
 
 [[package]]
 name = "proc-macro2"
-version = "1.0.56"
+version = "1.0.70"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "2b63bdb0cd06f1f4dedf69b254734f9b45af66e4a031e42a7480257d9898b435"
+checksum = "39278fbbf5fb4f646ce651690877f89d1c5811a3d4acb27700c1cb3cdb78fd3b"
 dependencies = [
  "unicode-ident",
 ]
@@ -649,7 +659,7 @@ dependencies = [
  "bytes",
  "cfg-if",
  "clap",
- "error-stack",
+ "error-stack 0.4.1",
  "futures",
  "ipcon-sys",
  "ipnetwork",

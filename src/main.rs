@@ -1,4 +1,3 @@
-//cspell:word netif ifname iftype netifs jinfo jdebug jwarn jerror rnetmgr routeif
 mod netif;
 mod netif_mon;
 mod rnetmgr_error;
@@ -6,7 +5,7 @@ mod rnetmgr_error;
 #[allow(unused)]
 use {
     clap::Parser,
-    error_stack::{IntoReport, Report, Result, ResultExt},
+    error_stack::{Report, Result, ResultExt},
     jlogger_tracing::{
         jdebug, jerror, jinfo, jtrace, jwarn, JloggerBuilder, LevelFilter, LogTimeFormat,
     },
@@ -59,22 +58,24 @@ async fn main_work() -> Result<(), RnetmgrError> {
 
     jinfo!("Use config: {}", cli.config_file);
 
-    let config_str = fs::read_to_string(cli.config_file.as_str())
-        .into_report()
-        .change_context(RnetmgrError::InvalidValue)
-        .attach_printable(format!("Failed to read config file {}", cli.config_file))?;
+    let config_str = fs::read_to_string(cli.config_file.as_str()).map_err(|e| {
+        Report::new(RnetmgrError::InvalidValue).attach_printable(format!(
+            "Failed to read config file {}: {}",
+            cli.config_file, e
+        ))
+    })?;
 
     jdebug!("{}", config_str);
 
-    let config = serde_json::from_str(&config_str)
-        .into_report()
-        .change_context(RnetmgrError::InvalidValue)
-        .attach_printable(format!("Config file {} is invalid", cli.config_file))?;
+    let config = serde_json::from_str(&config_str).map_err(|_e| {
+        Report::new(RnetmgrError::InvalidValue)
+            .attach_printable(format!("Config file {} is invalid", cli.config_file))
+    })?;
 
-    let dhcp_conf = fs::read_to_string(cli.dhcp_conf.as_str())
-        .into_report()
-        .change_context(RnetmgrError::InvalidValue)
-        .attach_printable(format!("Failed to read dhcp config file {}", cli.dhcp_conf))?;
+    let dhcp_conf = fs::read_to_string(cli.dhcp_conf.as_str()).map_err(|_| {
+        Report::new(RnetmgrError::InvalidValue)
+            .attach_printable(format!("Failed to read dhcp config file {}", cli.dhcp_conf))
+    })?;
 
     NetIfMon::run(config, dhcp_conf).await
 }
