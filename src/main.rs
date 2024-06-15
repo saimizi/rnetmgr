@@ -24,6 +24,9 @@ struct Cli {
     #[clap(short='d', long="dhcp-conf", default_value_t=String::from("/etc/dhcp4-template.conf"))]
     dhcp_conf: String,
 
+    #[clap(short = 'n', long)]
+    dnsmasq: bool,
+
     #[clap(short, long, parse(from_occurrences))]
     verbose: usize,
 }
@@ -72,10 +75,14 @@ async fn main_work() -> Result<(), RnetmgrError> {
             .attach_printable(format!("Config file {} is invalid", cli.config_file))
     })?;
 
-    let dhcp_conf = fs::read_to_string(cli.dhcp_conf.as_str()).map_err(|_| {
+    let mut dhcp_conf = fs::read_to_string(cli.dhcp_conf.as_str()).map_err(|_| {
         Report::new(RnetmgrError::InvalidValue)
             .attach_printable(format!("Failed to read dhcp config file {}", cli.dhcp_conf))
     })?;
+
+    if cli.dnsmasq {
+        dhcp_conf = String::new();
+    }
 
     NetIfMon::run(config, dhcp_conf).await
 }

@@ -301,39 +301,66 @@ impl NetIf {
 
         let interface = format!("{}", &self.ifname);
 
-        let conf_str = dhcp_conf
-            .replace("@INTERFACE@", &interface)
-            .replace("@SUBNET@", &subnet_str)
-            .replace("@START@", &start)
-            .replace("@END@", &end)
-            .replace("@GATEWAY_IP@", &ip_str);
+        if !dhcp_conf.is_empty() {
+            let conf_str = dhcp_conf
+                .replace("@INTERFACE@", &interface)
+                .replace("@SUBNET@", &subnet_str)
+                .replace("@START@", &start)
+                .replace("@END@", &end)
+                .replace("@GATEWAY_IP@", &ip_str);
 
-        let conf_file = format!("/tmp/dhcpv4_{}.conf", self.ifname);
-        let mut file = File::create(&conf_file)
-            .await
-            .map_err(|e| Report::new(RnetmgrError::SystemError).attach_printable(e))?;
+            let conf_file = format!("/tmp/dhcpv4_{}.conf", self.ifname);
+            let mut file = File::create(&conf_file)
+                .await
+                .map_err(|e| Report::new(RnetmgrError::SystemError).attach_printable(e))?;
 
-        file.write_all(conf_str.as_bytes()).await.map_err(|e| {
-            Report::new(RnetmgrError::SystemError)
-                .attach_printable(format!("Failed to write file {} : {e}", conf_str))
-        })?;
+            file.write_all(conf_str.as_bytes()).await.map_err(|e| {
+                Report::new(RnetmgrError::SystemError)
+                    .attach_printable(format!("Failed to write file {} : {e}", conf_str))
+            })?;
 
-        let _ = tokio::fs::create_dir("/var/run/kea").await;
-        let _ = tokio::fs::create_dir("/var/lib/kea").await;
+            let _ = tokio::fs::create_dir("/var/run/kea").await;
+            let _ = tokio::fs::create_dir("/var/lib/kea").await;
 
-        jinfo!("{}", conf_str);
-        let cmd = "/usr/sbin/kea-dhcp4";
-        let args = vec![String::from("-c"), conf_file];
+            jinfo!("{}", conf_str);
+            let cmd = "/usr/sbin/kea-dhcp4";
+            let args = vec![String::from("-c"), conf_file];
 
-        jinfo!("Start dhcp server for {}", self.ifname);
-        let cmd_str = format!("{} {}", cmd, args.join(" "));
-        jinfo!("CMD: {}", cmd_str);
-        let c = Command::new(cmd).args(args).spawn().map_err(|e| {
-            Report::new(RnetmgrError::SystemError)
-                .attach_printable(format!("Failed to run command {}: {e}", cmd_str))
-        })?;
+            jinfo!("Start dhcp server for {}", self.ifname);
+            let cmd_str = format!("{} {}", cmd, args.join(" "));
+            jinfo!("CMD: {}", cmd_str);
+            let c = Command::new(cmd).args(args).spawn().map_err(|e| {
+                Report::new(RnetmgrError::SystemError)
+                    .attach_printable(format!("Failed to run command {}: {e}", cmd_str))
+            })?;
 
-        self.dhcp_server = Some(c);
+            self.dhcp_server = Some(c);
+        } else {
+            let dhcp_range = format!("{},{}", start, end);
+            let interface = format!("--interface={}", interface);
+            let pid_file = format!("--pid-file=/tmp/dnsmasq_{}.pid", interface);
+            let lease_file = format!("--dhcp-leasefile=/var/lib/misc/dnsmasq.{}", interface);
+            let c = Command::new("dnsmasq")
+                .arg("--conf-file=/dev/null")
+                .args(["-u", "nobody"])
+                .arg("--strict-order")
+                .arg("--bind-interfaces")
+                .args(["--listen-address", ip_str.as_str()])
+                .args(["--dhcp-range", dhcp_range.as_str()])
+                .arg(pid_file.as_str())
+                .arg("--dhcp-lease-max=253")
+                .arg("--dhcp-no-override")
+                .arg("--except-interface=lo")
+                .arg(interface.as_str())
+                .arg(lease_file.as_str())
+                .arg("--dhcp-authoritative")
+                .spawn()
+                .map_err(|e| {
+                    Report::new(RnetmgrError::SystemError)
+                        .attach_printable(format!("Failed to run dnsmasq: {e}"))
+                })?;
+            self.dhcp_server = Some(c);
+        }
 
         Ok(())
     }
