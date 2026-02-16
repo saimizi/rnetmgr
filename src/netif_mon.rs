@@ -32,6 +32,90 @@ use {
     },
 };
 
+fn config_route(internal_if: &str, external_if: &str) -> Result<(), RnetmgrError> {
+    let ipt = iptables::new(false).map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to initialize iptables: {}", e))
+    })?;
+
+    // Flush filter and nat tables
+    ipt.flush_table("filter").map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to flush filter table: {}", e))
+    })?;
+    ipt.flush_table("nat").map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to flush nat table: {}", e))
+    })?;
+
+    // NAT masquerade on external interface
+    ipt.append(
+        "nat",
+        "POSTROUTING",
+        &format!("-o {} -j MASQUERADE", external_if),
+    )
+    .map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to add MASQUERADE rule: {}", e))
+    })?;
+
+    // Permit output to external network
+    ipt.append("filter", "OUTPUT", &format!("-o {} -j ACCEPT", external_if))
+        .map_err(|e| {
+            Report::new(RnetmgrError::SystemError).attach_printable(format!(
+                "Failed to add OUTPUT rule for {}: {}",
+                external_if, e
+            ))
+        })?;
+
+    // Permit internal network
+    ipt.append("filter", "INPUT", &format!("-i {} -j ACCEPT", internal_if))
+        .map_err(|e| {
+            Report::new(RnetmgrError::SystemError).attach_printable(format!(
+                "Failed to add INPUT rule for {}: {}",
+                internal_if, e
+            ))
+        })?;
+    ipt.append("filter", "OUTPUT", &format!("-o {} -j ACCEPT", internal_if))
+        .map_err(|e| {
+            Report::new(RnetmgrError::SystemError).attach_printable(format!(
+                "Failed to add OUTPUT rule for {}: {}",
+                internal_if, e
+            ))
+        })?;
+
+    // Permit loopback
+    ipt.append("filter", "INPUT", "-i lo -j ACCEPT")
+        .map_err(|e| {
+            Report::new(RnetmgrError::SystemError)
+                .attach_printable(format!("Failed to add loopback INPUT rule: {}", e))
+        })?;
+    ipt.append("filter", "OUTPUT", "-o lo -j ACCEPT")
+        .map_err(|e| {
+            Report::new(RnetmgrError::SystemError)
+                .attach_printable(format!("Failed to add loopback OUTPUT rule: {}", e))
+        })?;
+
+    // Permit forwarding from internal to external
+    ipt.append(
+        "filter",
+        "FORWARD",
+        &format!("-i {} -o {} -j ACCEPT", internal_if, external_if),
+    )
+    .map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to add FORWARD rule: {}", e))
+    })?;
+
+    // Enable IP forwarding
+    std::fs::write("/proc/sys/net/ipv4/ip_forward", "1").map_err(|e| {
+        Report::new(RnetmgrError::SystemError)
+            .attach_printable(format!("Failed to enable IP forwarding: {}", e))
+    })?;
+
+    Ok(())
+}
+
 #[cfg(feature = "enable_ipcon")]
 use ipcon_sys::{
     ipcon::{IPF_RCV_IF, IPF_SND_IF},
@@ -443,7 +527,11 @@ impl NetIfMon {
                         flags: lm.header.flags,
                     });
 
-                    jdebug!("{}", msg);
+                    jinfo!(
+                        newlink = ifname,
+                        idex = lm.header.index,
+                        mac = mac.clone().to_string()
+                    );
 
                     if let Some(s) = &mut sender {
                         if let Err(e) = s.send(msg).await {
@@ -616,12 +704,15 @@ impl NetIfMon {
                             .and_modify(|n| n.add_ipv4_addr(&addr))
                             .or_default();
 
+                        jinfo!(
+                            newaddr = addr.to_string(),
+                            ifname = ifname,
+                            index = netif.if_index()
+                        );
+
                         if !netif.is_valid() {
-                            return Err(Report::new(RnetmgrError::RtNetlinkError)
-                                .attach_printable(format!(
-                                    "NewAddress: netif {} is not found.",
-                                    ifname
-                                )));
+                            jerror!("NewAddress: netif {} is not found.", ifname);
+                            return Ok(false);
                         }
 
                         let msg = NetInfoMessage::NewAddress(NetInfoNewAddress {
@@ -629,8 +720,6 @@ impl NetIfMon {
                             if_index: netif.if_index(),
                             ipv4addr: addr,
                         });
-
-                        jdebug!("{}", msg);
 
                         if let Some(s) = &mut sender {
                             if let Err(e) = s.send(msg).await {
@@ -645,15 +734,8 @@ impl NetIfMon {
                                     jinfo!("Found IP address {}, start DHCP server.", ip);
                                     netif.start_dhcp_server(ip, self.dhcp_conf.as_str()).await?;
                                     if let Some(routeif) = &cfg.routeif {
-                                        let cmd = "/usr/sbin/config_route";
-                                        let args = vec![ifname, routeif.clone()];
-
                                         jinfo!("Setup route to {}", routeif);
-                                        let _ =
-                                            Command::new(cmd).args(args).spawn().map_err(|e| {
-                                                Report::new(RnetmgrError::SystemError)
-                                                    .attach_printable(e)
-                                            })?;
+                                        config_route(&ifname, routeif)?;
                                     }
                                 }
                             }
